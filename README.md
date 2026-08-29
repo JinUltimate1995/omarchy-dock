@@ -104,10 +104,13 @@ hot-reloads on save.
   `app_id` can be matched (webapps included), falling back to a generic
   tile for windows that ship no icon at all. This section appears and
   disappears with the windows themselves.
-- **Right-click** any icon for the pin menu: *Pin to Dock* on running
-  extras (via their resolved desktop entry), *Unpin from Dock* on pinned
-  apps. An unpinned app with open windows simply slides over to the
-  running section — nothing quits.
+- **Right-click** any icon for its menu: *New Window*, a jump list of
+  the app's open windows (click one to focus it, wherever it lives),
+  *Quit* (closes every window of the app), and *Pin to Dock* / *Unpin
+  from Dock*. An unpinned app with open windows simply slides over to
+  the running section — nothing quits.
+- **Drag a pinned icon** left or right to reorder it — an accent bar
+  shows where it will land, and the new order persists.
 - **Hover**: icons magnify with distance-based falloff, like the macOS
   dock.
 - **Running indicator**: a small accent-colored dot appears under any

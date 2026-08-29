@@ -350,10 +350,19 @@ Item {
     WlrLayershell.layer: WlrLayer.Top
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
-    // Only the dock card (see below) accepts input; the rest of this
-    // full-screen surface stays click-through so it never blocks the
-    // desktop underneath, exactly like the notifications/OSD overlays.
-    mask: Region { item: dockCard }
+    // Only the dock card (plus the context menu when open) accepts input;
+    // the rest of this full-screen surface stays click-through so it never
+    // blocks the desktop underneath, exactly like the notifications/OSD
+    // overlays. A long window-list menu can extend above dockCard's
+    // bounds, so the mask is a computed rect that grows upward with it —
+    // one flat region, no nested-Region semantics to trip over.
+    readonly property int maskTopOverflow: contextMenu.visible ? Math.max(0, -contextMenu.y) : 0
+    mask: Region {
+      x: dockCard.x
+      y: dockCard.y - panel.maskTopOverflow
+      width: dockCard.width
+      height: dockCard.height + panel.maskTopOverflow
+    }
 
     readonly property real screenWidth: panel.screen ? panel.screen.width : 1920
 
@@ -399,6 +408,30 @@ Item {
       // ---- right-click pin menu ----
       property var menuData: null // modelData of the icon the menu is open for
       property real menuX: 0
+
+      // ---- drag-to-reorder (pins only) ----
+      property int dragIndex: -1       // dockModel index of the pin being dragged
+      property int dragTargetIndex: -1 // insertion point among pins [0..pinCount]
+
+      function insertionIndexAt(xInCard) {
+        var rel = xInCard - iconRow.x
+        var idx = Math.round(rel / (iconSize + iconGap))
+        return Math.max(0, Math.min(root.resolvedPins.length, idx))
+      }
+
+      function finishDrag() {
+        var from = dragIndex
+        var to = dragTargetIndex
+        dragIndex = -1
+        dragTargetIndex = -1
+        if (from < 0 || to < 0 || from >= root.pinnedIds.length) return
+        var insertAt = to > from ? to - 1 : to
+        if (insertAt === from) return
+        var ids = root.pinnedIds.slice()
+        var moved = ids.splice(from, 1)[0]
+        ids.splice(insertAt, 0, moved)
+        root.writePinned(ids)
+      }
 
       // ---- hover magnification ----
       property real hoverX: -100000
@@ -458,7 +491,7 @@ Item {
         onPositionChanged: dockCard.hoverX = mouseX
         onExited: {
           dockCard.hoverX = -100000
-          dockCard.menuData = null
+          menuCloseTimer.restart()
         }
       }
 
@@ -530,6 +563,7 @@ Item {
               anchors.bottomMargin: dockCard.padY + tile.bounceOffset
               transformOrigin: Item.Bottom
               scale: slot.targetScale
+              opacity: dockCard.dragIndex === slot.index ? 0.35 : 1.0
 
               property real bounceOffset: 0
 
@@ -624,6 +658,7 @@ Item {
             }
 
             MouseArea {
+              id: slotMa
               anchors.fill: tile
               visible: !slot.isSep
               enabled: !slot.isSep
@@ -632,9 +667,42 @@ Item {
               cursorShape: Qt.PointingHandCursor
               onEntered: slot.hovered = true
               onExited: slot.hovered = false
+
+              // Drag-to-reorder: pins only. A left-press that travels more
+              // than half an icon horizontally becomes a drag; release
+              // commits the new order through the same writePinned path the
+              // menu uses.
+              readonly property bool draggable: !slot.isSep && slot.modelData.isExtra !== true
+              property real pressX: 0
+              property bool didDrag: false
+
+              onPressed: mouse => {
+                if (mouse.button === Qt.LeftButton) {
+                  pressX = mouse.x
+                  didDrag = false
+                }
+              }
+              onPositionChanged: mouse => {
+                if (!pressed || !draggable) return
+                if (!didDrag && Math.abs(mouse.x - pressX) > dockCard.iconSize * 0.5) {
+                  didDrag = true
+                  dockCard.menuData = null
+                  dockCard.dragIndex = slot.index
+                }
+                if (didDrag) {
+                  dockCard.dragTargetIndex = dockCard.insertionIndexAt(iconRow.x + slot.x + mouse.x)
+                }
+              }
+              onReleased: {
+                if (didDrag) dockCard.finishDrag()
+              }
               onClicked: mouse => {
+                if (didDrag) {
+                  didDrag = false
+                  return
+                }
                 if (mouse.button === Qt.RightButton) {
-                  // Toggle the pin menu for this icon.
+                  // Toggle the menu for this icon.
                   if (dockCard.menuData === slot.modelData) {
                     dockCard.menuData = null
                   } else {
@@ -679,65 +747,185 @@ Item {
         }
       }
 
-      // ---- right-click pin menu ----
+      // ---- right-click menu ----
       //
-      // One action per target: unpin a pinned app, pin a running extra
-      // (via its resolved desktop entry). Kept inside dockCard's bounds
-      // (it fits in the magnification headroom) so the existing input
-      // mask covers it. Closes on action, on left-click anywhere in the
-      // dock, on right-click toggle, or when the pointer leaves the dock.
+      // Per-icon context menu: New Window, a jump list of the app's open
+      // windows (click one to focus it, wherever it lives), Quit (closes
+      // every window via the same foreign-toplevel protocol activate()
+      // uses), and Pin/Unpin. Can extend above dockCard's bounds, so the
+      // panel's input mask unions it in explicitly. Closes on action, on
+      // left-click of any icon, on right-click toggle, or shortly after
+      // the pointer leaves both the dock and the menu.
       Rectangle {
         id: contextMenu
-        readonly property var menuData: dockCard.menuData
-        readonly property bool targetPinned: menuData !== null && menuData.isExtra !== true
-        readonly property string pinId: {
-          if (menuData === null) return ""
-          if (menuData.isExtra === true)
-            return (menuData.entry && menuData.entry.id) ? String(menuData.entry.id) : ""
-          return String(menuData.id || "")
-        }
-        readonly property bool actionable: targetPinned || pinId.length > 0
 
-        visible: menuData !== null
+        readonly property var menuRows: {
+          var d = dockCard.menuData
+          if (d === null) return []
+          var rows = []
+          var tls = (d.isExtra === true)
+            ? (root.runningAppIds[d.key] || [])
+            : (root.toplevelsFor(d) || [])
+          var canLaunch = d.isExtra !== true || (d.entry !== null && d.entry !== undefined)
+          if (canLaunch) rows.push({ kind: "launch", label: "New Window" })
+          if (tls.length > 0) {
+            if (rows.length > 0) rows.push({ kind: "sep" })
+            for (var i = 0; i < tls.length && i < 8; i++) {
+              var title = String((tls[i] && tls[i].title) || "(untitled)")
+              if (title.length > 42) title = title.slice(0, 41) + "…"
+              rows.push({ kind: "window", label: title, tl: tls[i] })
+            }
+            rows.push({ kind: "sep" })
+            rows.push({ kind: "quit",
+                        label: tls.length > 1 ? "Quit (" + tls.length + " windows)" : "Quit" })
+          }
+          if (d.isExtra === true) {
+            if (d.entry && d.entry.id) rows.push({ kind: "pin", label: "Pin to Dock" })
+          } else {
+            rows.push({ kind: "unpin", label: "Unpin from Dock" })
+          }
+          return rows
+        }
+
+        function doAction(row) {
+          var d = dockCard.menuData
+          dockCard.menuData = null
+          if (d === null || !row) return
+          if (row.kind === "window") {
+            if (row.tl && typeof row.tl.activate === "function") row.tl.activate()
+          } else if (row.kind === "launch") {
+            var id = d.isExtra === true ? (d.entry ? d.entry.id : "") : d.id
+            if (id && root.appLibrary) root.appLibrary.launch(String(id), String(d.name || ""))
+          } else if (row.kind === "quit") {
+            var tls = (d.isExtra === true)
+              ? (root.runningAppIds[d.key] || [])
+              : (root.toplevelsFor(d) || [])
+            for (var i = 0; i < tls.length; i++) {
+              if (tls[i] && typeof tls[i].close === "function") tls[i].close()
+            }
+          } else if (row.kind === "pin") {
+            root.pinApp(d.entry ? d.entry.id : "")
+          } else if (row.kind === "unpin") {
+            root.unpinApp(String(d.id || ""))
+          }
+        }
+
+        // Row sizing comes from measuring the longest label, NOT from the
+        // Column's implicit size: rows binding their width to the column
+        // while the column derives its size from the rows is a stable
+        // 0x0 deadlock (both start at zero and agree forever).
+        readonly property string longestLabel: {
+          var best = ""
+          for (var i = 0; i < menuRows.length; i++) {
+            var l = String(menuRows[i].label || "")
+            if (l.length > best.length) best = l
+          }
+          return best
+        }
+        readonly property real rowWidth: menuMetrics.width + Style.space(28)
+        readonly property real rowHeight: menuMetrics.height + Style.space(12)
+
+        TextMetrics {
+          id: menuMetrics
+          font.family: Style.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          text: contextMenu.longestLabel
+        }
+
+        visible: dockCard.menuData !== null && menuRows.length > 0
         z: 100
         radius: Style.space(8)
         color: Util.alpha(Color.popups.background, 0.98)
         border.color: Util.alpha(Color.popups.border, 0.5)
         border.width: 1
-        width: menuLabel.implicitWidth + Style.space(28)
-        height: menuLabel.implicitHeight + Style.space(16)
+        width: rowWidth + Style.space(8)
+        height: menuCol.implicitHeight + Style.space(8)
         x: Math.max(0, Math.min(dockCard.menuX - width / 2, dockCard.width - width))
-        y: Math.max(0, dockCard.height - dockCard.cardHeight - height - Style.space(8))
-
-        Rectangle {
-          anchors.fill: parent
-          anchors.margins: Style.space(3)
-          radius: Style.space(6)
-          color: menuMouse.containsMouse && contextMenu.actionable ? Style.hoverFill : "transparent"
-        }
-
-        Text {
-          id: menuLabel
-          anchors.centerIn: parent
-          text: contextMenu.targetPinned
-            ? "Unpin from Dock"
-            : (contextMenu.pinId.length > 0 ? "Pin to Dock" : "No launcher to pin")
-          color: contextMenu.actionable ? Color.popups.text : Util.alpha(Color.popups.text, 0.5)
-          font.family: Style.fontFamily
-          font.pixelSize: Style.font.bodySmall
-        }
+        y: dockCard.height - dockCard.cardHeight - height - Style.space(8)
 
         MouseArea {
-          id: menuMouse
+          id: menuHover
           anchors.fill: parent
           hoverEnabled: true
-          enabled: contextMenu.actionable
-          cursorShape: contextMenu.actionable ? Qt.PointingHandCursor : Qt.ArrowCursor
-          onClicked: {
-            if (contextMenu.targetPinned) root.unpinApp(contextMenu.pinId)
-            else root.pinApp(contextMenu.pinId)
-            dockCard.menuData = null
+          acceptedButtons: Qt.NoButton
+          onExited: menuCloseTimer.restart()
+        }
+
+        Column {
+          id: menuCol
+          x: Style.space(4)
+          y: Style.space(4)
+
+          Repeater {
+            model: contextMenu.menuRows
+
+            delegate: Item {
+              id: menuRow
+              required property var modelData
+              readonly property bool isSep: modelData.kind === "sep"
+              width: contextMenu.rowWidth
+              height: isSep ? Style.space(7) : contextMenu.rowHeight
+
+              Rectangle {
+                visible: menuRow.isSep
+                anchors.centerIn: parent
+                width: parent.width - Style.space(8)
+                height: 1
+                color: Util.alpha(Color.popups.border, 0.4)
+              }
+
+              Rectangle {
+                visible: !menuRow.isSep
+                anchors.fill: parent
+                radius: Style.space(6)
+                color: rowMa.containsMouse ? Style.hoverFill : "transparent"
+              }
+
+              Text {
+                id: rowText
+                visible: !menuRow.isSep
+                anchors.verticalCenter: parent.verticalCenter
+                x: Style.space(14)
+                text: menuRow.isSep ? "" : menuRow.modelData.label
+                color: Color.popups.text
+                font.family: Style.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              MouseArea {
+                id: rowMa
+                anchors.fill: parent
+                visible: !menuRow.isSep
+                enabled: !menuRow.isSep
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: contextMenu.doAction(menuRow.modelData)
+              }
+            }
           }
+        }
+      }
+
+      // Insertion indicator while dragging a pin.
+      Rectangle {
+        visible: dockCard.dragTargetIndex >= 0
+        width: Style.space(3)
+        height: dockCard.iconSize
+        radius: width / 2
+        color: Color.accent
+        z: 50
+        x: iconRow.x + dockCard.dragTargetIndex * (dockCard.iconSize + dockCard.iconGap)
+           - dockCard.iconGap / 2 - width / 2
+        y: dockCard.height - dockCard.cardHeight + dockCard.padY
+      }
+
+      // Grace period so the pointer can travel dock -> menu without the
+      // menu vanishing mid-flight.
+      Timer {
+        id: menuCloseTimer
+        interval: 300
+        onTriggered: {
+          if (!hoverArea.containsMouse && !menuHover.containsMouse) dockCard.menuData = null
         }
       }
     }
