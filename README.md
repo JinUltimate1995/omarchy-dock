@@ -121,6 +121,36 @@ hot-reloads on save.
   particular app, its `app_id` doesn't match closely enough; nothing to
   fix on the launch side, it just won't show the dot.
 
+## Why there's no Minimize (yet)
+
+Minimize is designed and proven, but deliberately not shipped. Hyprland
+has no native minimize; the working equivalent is parking a window in a
+hidden special workspace — the same mechanism as Omarchy's scratchpad
+(SUPER + S):
+
+```lua
+-- park (minimize), no focus change:
+hl.dispatch(hl.dsp.window.move({ workspace = "special:minimized",
+                                 follow = false, window = w }))
+-- restore to whatever workspace you're on now:
+hl.dispatch(hl.dsp.window.move({ workspace = tostring(hl.get_active_workspace().id),
+                                 follow = false, window = w }))
+```
+
+The dock version would be a *Minimize* item in the right-click menu
+(macOS "Hide" semantics — all of an app's windows park, its icon dims,
+clicking restores to your current workspace).
+
+The reason it's not implemented: everything else in this dock rides on
+**stable Wayland protocols** (foreign-toplevel management) and survives
+compositor upgrades untouched. Minimize would be the one feature bound
+to **Hyprland's embedded Lua API** — a young, fork-specific surface that
+already broke the classic `hyprctl dispatch` syntax and can shift again
+with any Omarchy Hyprland bump. One feature silently breaking on
+upgrade would cost more trust than minimize is worth. If that API
+settles (or a portable minimize lands in a Wayland protocol), the recipe
+above is the whole implementation — PRs welcome.
+
 ## Updating
 
 ```bash
