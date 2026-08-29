@@ -121,6 +121,40 @@ Item {
     if (ids.length !== root.pinnedIds.length) root.writePinned(ids)
   }
 
+  // ------------------------------------------------------------ settings
+
+  // Same out-of-plugin-dir rule as the pin file (the registry reload
+  // problem). Currently one knob: {"autohide": false} to keep the dock
+  // always visible.
+  readonly property string settingsPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/dino.dock.settings.json"
+  property bool autohide: true
+
+  function loadSettings(rawText) {
+    var v = true
+    try {
+      var parsed = JSON.parse(String(rawText || ""))
+      if (parsed && typeof parsed.autohide === "boolean") v = parsed.autohide
+    } catch (e) {}
+    root.autohide = v
+  }
+
+  FileView {
+    id: settingsFile
+    path: root.settingsPath
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.loadSettings(text())
+    onFileChanged: reload()
+    onLoadFailed: root.loadSettings("")
+  }
+
+  // Auto-hide state. The dock slides below the screen edge when nothing
+  // needs it; a 4px reveal strip (separate tiny layer surface, only
+  // mapped while hidden) brings it back when the pointer hits the bottom
+  // of the screen — the macOS/taskbar autohide contract.
+  property bool dockHidden: false
+  onAutohideChanged: if (!autohide) dockHidden = false
+
   function rebuildEntryIndex() {
     var idx = {}
     var values = (typeof DesktopEntries !== "undefined" && DesktopEntries.applications) ? DesktopEntries.applications.values : []
@@ -357,11 +391,39 @@ Item {
     // bounds, so the mask is a computed rect that grows upward with it —
     // one flat region, no nested-Region semantics to trip over.
     readonly property int maskTopOverflow: contextMenu.visible ? Math.max(0, -contextMenu.y) : 0
+    // Extends from the (possibly menu-raised) top of the dock down to the
+    // physical screen edge, so a pointer parked at the very bottom still
+    // counts as "at the dock" and autohide doesn't oscillate. Collapses to
+    // nothing while hidden — a hidden dock must not eat clicks.
     mask: Region {
       x: dockCard.x
-      y: dockCard.y - panel.maskTopOverflow
+      y: root.dockHidden ? 0 : dockCard.y - panel.maskTopOverflow
+      width: root.dockHidden ? 0 : dockCard.width
+      height: root.dockHidden ? 0 : panel.height - dockCard.y + panel.maskTopOverflow
+    }
+
+    // What keeps the dock on screen: pointer anywhere over/under the card
+    // (nearMa spans to the screen edge), the menu, or an in-flight drag —
+    // or autohide being off. Losing all of them starts the hide timer.
+    readonly property bool dockWanted: !root.autohide
+      || nearMa.containsMouse || menuHover.containsMouse || edgeMa.containsMouse
+      || dockCard.menuData !== null || dockCard.dragIndex >= 0
+    onDockWantedChanged: if (dockWanted) root.dockHidden = false
+
+    Timer {
+      interval: 700
+      running: root.autohide && !panel.dockWanted && !root.dockHidden
+      onTriggered: root.dockHidden = true
+    }
+
+    MouseArea {
+      id: nearMa
+      x: dockCard.x
+      y: dockCard.y
       width: dockCard.width
-      height: dockCard.height + panel.maskTopOverflow
+      height: Math.max(0, panel.height - dockCard.y)
+      hoverEnabled: true
+      acceptedButtons: Qt.NoButton
     }
 
     readonly property real screenWidth: panel.screen ? panel.screen.width : 1920
@@ -370,7 +432,13 @@ Item {
       id: dockCard
       anchors.horizontalCenter: parent.horizontalCenter
       anchors.bottom: parent.bottom
-      anchors.bottomMargin: Math.max(Style.space(10), Style.gapsOut)
+      readonly property int restMargin: Math.max(Style.space(10), Style.gapsOut)
+      anchors.bottomMargin: root.dockHidden
+        ? -(cardHeight + restMargin + Style.space(6))
+        : restMargin
+      Behavior on anchors.bottomMargin {
+        NumberAnimation { duration: 200; easing.type: Easing.OutCubic }
+      }
       width: cardWidth
       height: cardHeight + headroom
 
@@ -928,6 +996,33 @@ Item {
           if (!hoverArea.containsMouse && !menuHover.containsMouse) dockCard.menuData = null
         }
       }
+    }
+  }
+
+  // 2px reveal strip along the bottom screen edge, its own tiny layer
+  // surface (whole-surface input by default) — unioning a full-width
+  // strip into the main panel's single rectangular mask would swallow
+  // clicks beside the dock. Kept mapped the whole time autohide is on,
+  // NOT just while hidden: unmapping it under the pointer freezes its
+  // MouseArea's containsMouse at true (no exit event ever arrives), which
+  // pinned the dock open on the first live test.
+  PanelWindow {
+    id: revealWindow
+    visible: root.autohide
+    screen: root.targetScreen
+    anchors { bottom: true; left: true; right: true }
+    implicitHeight: 2
+    color: "transparent"
+    WlrLayershell.namespace: "omarchy-dock-reveal"
+    WlrLayershell.layer: WlrLayer.Top
+    WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+    exclusionMode: ExclusionMode.Ignore
+
+    MouseArea {
+      id: edgeMa
+      anchors.fill: parent
+      hoverEnabled: true
+      acceptedButtons: Qt.NoButton
     }
   }
 }

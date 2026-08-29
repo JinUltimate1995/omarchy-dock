@@ -111,6 +111,15 @@ hot-reloads on save.
   the running section — nothing quits.
 - **Drag a pinned icon** left or right to reorder it — an accent bar
   shows where it will land, and the new order persists.
+- **Auto-hide (default on)**: the dock slides off-screen when the
+  pointer leaves it, so it never sits on top of your tiled windows. Push
+  the pointer to the bottom edge of the screen and it slides back —
+  same contract as the macOS Dock or a hidden taskbar. A 2px strip
+  along the bottom edge catches the reveal (that sliver is reserved
+  while auto-hide is on). To keep the dock always visible, create
+   containing
+   — hot-reloads on save, same out-of-plugin-dir
+  location as the pin file.
 - **Hover**: icons magnify with distance-based falloff, like the macOS
   dock.
 - **Running indicator**: a small accent-colored dot appears under any
