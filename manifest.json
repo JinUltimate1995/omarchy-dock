@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "dino.dock",
   "name": "Floating Dock",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "dino",
-  "description": "Apple-style floating dock: pinned launchers, hover magnification, launch bounce, running-app indicators.",
+  "description": "Apple-style floating dock: pinned launchers, running apps with click-to-focus and window cycling, hover magnification, launch bounce, running-app indicators.",
   "kinds": ["panel"],
   "keepLoaded": true,
   "entryPoints": { "panel": "Dock.qml" }

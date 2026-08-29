@@ -101,9 +101,9 @@ Item {
 
   // ------------------------------------------------------------ running apps
 
-  // Lowercased Wayland app_id -> toplevel. Heuristic matching (see README):
-  // Wayland gives no reliable app_id <-> .desktop-id mapping, so this is a
-  // best-effort dot, not a guarantee.
+  // Lowercased Wayland app_id -> [toplevels]. Heuristic matching (see
+  // README): Wayland gives no reliable app_id <-> .desktop-id mapping, so
+  // this is a best-effort match, not a guarantee.
   property var runningAppIds: ({})
 
   function rebuildRunning() {
@@ -113,7 +113,9 @@ Item {
       for (var i = 0; i < values.length; i++) {
         var t = values[i]
         var key = String((t && t.appId) || "").toLowerCase()
-        if (key.length > 0 && !map[key]) map[key] = t
+        if (key.length === 0) continue
+        if (!map[key]) map[key] = []
+        map[key].push(t)
       }
     } catch (e) {}
     root.runningAppIds = map
@@ -124,23 +126,101 @@ Item {
     function onValuesChanged() { root.rebuildRunning() }
   }
 
-  function toplevelFor(pin) {
+  // The app_id key a pin's running windows live under, or "" if none.
+  function runningKeyFor(pin) {
     var needle1 = String(pin.id || "").toLowerCase()
     var needle2 = pin.name ? String(pin.name).toLowerCase() : ""
     for (var key in root.runningAppIds) {
-      if (key === needle1) return root.runningAppIds[key]
-      if (needle1.length > 0 && (key.indexOf(needle1) !== -1 || needle1.indexOf(key) !== -1)) return root.runningAppIds[key]
-      if (needle2.length > 0 && key.indexOf(needle2) !== -1) return root.runningAppIds[key]
+      if (key === needle1) return key
+      if (needle1.length > 0 && (key.indexOf(needle1) !== -1 || needle1.indexOf(key) !== -1)) return key
+      if (needle2.length > 0 && key.indexOf(needle2) !== -1) return key
+    }
+    return ""
+  }
+
+  function toplevelsFor(pin) {
+    var key = root.runningKeyFor(pin)
+    return key.length > 0 ? root.runningAppIds[key] : null
+  }
+
+  // Click on a running app: focus its window. Clicked again while one of
+  // its windows is already focused: cycle to its next window — that plus
+  // activate() switching workspaces is what makes the dock a mouse-only
+  // way to move between open programs, macOS style.
+  function focusNext(toplevels) {
+    if (!toplevels || toplevels.length === 0) return
+    var active = -1
+    for (var i = 0; i < toplevels.length; i++) {
+      if (toplevels[i] && toplevels[i].activated === true) { active = i; break }
+    }
+    var next = toplevels[(active + 1) % toplevels.length]
+    if (next && typeof next.activate === "function") next.activate()
+  }
+
+  function launchOrFocus(pin, toplevels) {
+    if (toplevels && toplevels.length > 0) {
+      root.focusNext(toplevels)
+    } else if (!pin.isExtra && root.appLibrary) {
+      root.appLibrary.launch(pin.id, pin.name)
+    }
+  }
+
+  // Best-effort desktop entry for a bare Wayland app_id (exact id first,
+  // then case-insensitive, then substring either way) — same spirit as
+  // runningKeyFor, in the other direction.
+  function entryForAppId(appId) {
+    var idx = root.entryIndex
+    if (idx[appId]) return idx[appId]
+    var lower = String(appId).toLowerCase()
+    var keys = Object.keys(idx)
+    for (var i = 0; i < keys.length; i++) {
+      if (keys[i].toLowerCase() === lower) return idx[keys[i]]
+    }
+    for (i = 0; i < keys.length; i++) {
+      var k = keys[i].toLowerCase()
+      if (k.indexOf(lower) !== -1 || lower.indexOf(k) !== -1) return idx[keys[i]]
     }
     return null
   }
 
-  function launchOrFocus(pin, toplevel) {
-    if (toplevel && typeof toplevel.activate === "function") {
-      toplevel.activate()
-    } else if (root.appLibrary) {
-      root.appLibrary.launch(pin.id, pin.name)
+  // Running apps that resolve to no pinned slot. They render to the right
+  // of a divider, macOS style, so every open program is clickable from the
+  // dock even when it was launched elsewhere. Sorted by app_id so the row
+  // doesn't reshuffle every time focus moves.
+  readonly property var runningExtras: {
+    var claimed = {}
+    for (var i = 0; i < root.resolvedPins.length; i++) {
+      var key = root.runningKeyFor(root.resolvedPins[i])
+      if (key.length > 0) claimed[key] = true
     }
+    var out = []
+    var keys = Object.keys(root.runningAppIds).sort()
+    for (i = 0; i < keys.length; i++) {
+      if (claimed[keys[i]]) continue
+      var tls = root.runningAppIds[keys[i]]
+      var appId = tls[0] ? String(tls[0].appId || keys[i]) : keys[i]
+      var entry = root.entryForAppId(appId)
+      out.push({
+        isExtra: true,
+        key: keys[i],
+        id: appId,
+        entry: entry,
+        name: entry ? String(entry.name || appId) : ((tls[0] && tls[0].title) ? String(tls[0].title) : appId),
+        icon: (entry && entry.icon) ? entry.icon : appId
+      })
+    }
+    return out
+  }
+
+  // Pinned apps, then a separator, then running unpinned apps — the whole
+  // row the dock renders.
+  readonly property var dockModel: {
+    var out = root.resolvedPins.slice()
+    if (root.runningExtras.length > 0) {
+      out.push({ isSeparator: true })
+      out = out.concat(root.runningExtras)
+    }
+    return out
   }
 
   Component.onCompleted: {
@@ -235,18 +315,24 @@ Item {
       // Wide enough that the endmost icons clear the capsule's curved ends.
       readonly property int padX: Style.space(24)
       readonly property int padY: Style.space(8)
-      readonly property int count: Math.max(1, root.resolvedPins.length)
+      readonly property bool hasSeparator: root.runningExtras.length > 0
+      readonly property int sepWidth: Style.space(2)
+      // Icon slots (pins + running extras); the separator is its own thin
+      // slot that takes sepWidth instead of iconSize.
+      readonly property int iconCount: Math.max(1, root.dockModel.length - (hasSeparator ? 1 : 0))
+      readonly property int slotCount: iconCount + (hasSeparator ? 1 : 0)
       readonly property real availableWidth: panel.screenWidth * 0.86
 
       // Grow wider up to ~86% of screen width; past that, shrink icons to
       // fit — the same trade-off the real macOS dock makes.
-      readonly property int naturalWidth: count * maxIconSize + (count - 1) * iconGap + padX * 2
+      readonly property int fixedWidth: (slotCount - 1) * iconGap + (hasSeparator ? sepWidth : 0) + padX * 2
+      readonly property int naturalWidth: iconCount * maxIconSize + fixedWidth
       readonly property int iconSize: naturalWidth <= availableWidth
         ? maxIconSize
-        : Math.max(minIconSize, Math.floor((availableWidth - padX * 2 - (count - 1) * iconGap) / count))
+        : Math.max(minIconSize, Math.floor((availableWidth - fixedWidth) / iconCount))
 
-      readonly property int cardWidth: root.resolvedPins.length > 0
-        ? (iconSize * count + iconGap * (count - 1) + padX * 2)
+      readonly property int cardWidth: root.dockModel.length > 0
+        ? (iconSize * iconCount + fixedWidth)
         : (maxIconSize + padX * 2)
       readonly property int cardHeight: iconSize + padY * 2
       // Extra vertical room above the pill so magnified/bouncing icons have
@@ -320,20 +406,36 @@ Item {
         spacing: dockCard.iconGap
 
         Repeater {
-          model: root.resolvedPins
+          model: root.dockModel
 
           delegate: Item {
             id: slot
             required property var modelData
             required property int index
-            width: dockCard.iconSize
+            readonly property bool isSep: slot.modelData.isSeparator === true
+            width: slot.isSep ? dockCard.sepWidth : dockCard.iconSize
             height: dockCard.height
 
             readonly property real slotCenterX: iconRow.x + slot.x + width / 2
-            readonly property real targetScale: dockCard.scaleFor(slotCenterX)
+            readonly property real targetScale: slot.isSep ? 1.0 : dockCard.scaleFor(slotCenterX)
             property bool hovered: false
-            readonly property var runningToplevel: root.toplevelFor(slot.modelData)
-            readonly property bool isRunning: slot.runningToplevel !== null
+            readonly property var runningToplevels: slot.isSep ? null
+              : (slot.modelData.isExtra === true
+                  ? (root.runningAppIds[slot.modelData.key] || null)
+                  : root.toplevelsFor(slot.modelData))
+            readonly property bool isRunning: slot.runningToplevels !== null && slot.runningToplevels.length > 0
+
+            // The pins/running divider — a soft hairline like macOS's.
+            Rectangle {
+              visible: slot.isSep
+              width: dockCard.sepWidth
+              height: dockCard.iconSize * 0.72
+              radius: width / 2
+              color: Util.alpha(Color.popups.border, 0.45)
+              anchors.horizontalCenter: parent.horizontalCenter
+              anchors.bottom: parent.bottom
+              anchors.bottomMargin: dockCard.padY + (dockCard.iconSize - height) / 2
+            }
 
             Rectangle {
               id: dot
@@ -349,7 +451,8 @@ Item {
 
             Rectangle {
               id: tile
-              width: dockCard.iconSize
+              visible: !slot.isSep
+              width: slot.isSep ? 0 : dockCard.iconSize
               height: dockCard.iconSize
               radius: Style.space(12)
               color: slot.hovered ? Style.hoverFill : "transparent"
@@ -408,13 +511,33 @@ Item {
                 // almost everything here, so prefer it explicitly and only
                 // fall back to the normal themed lookup for the rare pin it
                 // doesn't cover (e.g. omacalc, an Omarchy-only app).
-                readonly property string papirusPath: "file:///usr/share/icons/Papirus/64x64/apps/" + slot.modelData.icon + ".svg"
-                readonly property string themedPath: root.appLibrary ? root.appLibrary.iconSource(slot.modelData.icon) : ""
+                readonly property string papirusPath: "file:///usr/share/icons/Papirus/64x64/apps/" + (slot.modelData.icon || "") + ".svg"
+                // Resolve through Qt's icon theme engine (Quickshell.iconPath
+                // is synchronous — no appLibrary refresh race), with
+                // appLibrary as a further fallback for anything exotic.
+                readonly property string themedPath: {
+                  var ic = String(slot.modelData.icon || "")
+                  if (ic.length === 0) return ""
+                  if (ic.charAt(0) === "/") return "file://" + ic
+                  try {
+                    var p = Quickshell.iconPath(ic, true)
+                    if (p && p.length > 0) return p.charAt(0) === "/" ? "file://" + p : p
+                  } catch (e) {}
+                  return root.appLibrary ? root.appLibrary.iconSource(ic) : ""
+                }
+                // Last resort for running apps whose app_id resolves to no
+                // usable icon anywhere (e.g. bare agent/terminal wrappers):
+                // a generic app tile beats an invisible one.
+                readonly property string genericPath: "file:///usr/share/icons/Papirus/64x64/apps/application-default-icon.svg"
 
                 source: icon.papirusPath
                 onStatusChanged: {
-                  if (status === Image.Error && source.toString() !== icon.themedPath) {
+                  if (status !== Image.Error) return
+                  var s = source.toString()
+                  if (s === icon.papirusPath && icon.themedPath.length > 0 && icon.themedPath !== s) {
                     source = icon.themedPath
+                  } else if (s !== icon.genericPath) {
+                    source = icon.genericPath
                   }
                 }
               }
@@ -439,13 +562,17 @@ Item {
 
             MouseArea {
               anchors.fill: tile
+              visible: !slot.isSep
+              enabled: !slot.isSep
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
               onEntered: slot.hovered = true
               onExited: slot.hovered = false
               onClicked: {
-                bounceAnim.start()
-                root.launchOrFocus(slot.modelData, slot.runningToplevel)
+                // Bounce is a "launching" cue — focusing an already-running
+                // window just switches to it, no theatrics (macOS again).
+                if (!slot.isRunning) bounceAnim.start()
+                root.launchOrFocus(slot.modelData, slot.runningToplevels)
               }
             }
 
@@ -465,7 +592,7 @@ Item {
               Text {
                 id: tooltipLabel
                 anchors.centerIn: parent
-                text: slot.modelData.name
+                text: slot.modelData.name || ""
                 color: Color.tooltip.text
                 font.family: Style.fontFamily
                 font.pixelSize: Style.font.bodySmall

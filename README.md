@@ -1,8 +1,10 @@
 # Floating Dock
 
 An Apple-style floating dock for [Omarchy](https://omarchy.org): pinned
-launchers along the bottom of the screen, hover magnification, a launch
-bounce, running-app indicators, and a glassy capsule look. Built as a
+launchers along the bottom of the screen, every running app shown to the
+right of a divider (click any of them to jump to that window, across
+workspaces), hover magnification, a launch bounce, running-app
+indicators, and a glassy capsule look. Built as a
 native `omarchy-shell` plugin (same tech as the bar/OSD), so it's themed
 automatically and survives theme switches.
 
@@ -78,11 +80,21 @@ hot-reloads on save.
 
 - **Click** a pinned icon: focuses its window if one is already open,
   otherwise launches it (via the shared `AppLibrary` service — same
-  launch path as the Omarchy menu).
+  launch path as the Omarchy menu). Focusing follows the window to
+  whatever workspace it lives on — the compositor switches for you.
+- **Click again** while an app's window is already focused: cycles to
+  that app's next window, so a browser with three windows is three
+  clicks to tour, no keyboard involved.
+- **Running apps you didn't pin** appear to the right of a thin divider,
+  macOS style — every open program is clickable from the dock no matter
+  how it was launched. Icons resolve desktop-entry art where the
+  `app_id` can be matched (webapps included), falling back to a generic
+  tile for windows that ship no icon at all. This section appears and
+  disappears with the windows themselves.
 - **Hover**: icons magnify with distance-based falloff, like the macOS
   dock.
 - **Running indicator**: a small accent-colored dot appears under any
-  pinned app with an open window. Matching is done by comparing the
+  app with an open window, pinned or not. Matching is done by comparing the
   window's Wayland `app_id` against the desktop entry's ID/name — this is
   a heuristic (Wayland has no fully reliable "this app_id came from this
   .desktop file" mapping), so if a running dot doesn't light up for a
