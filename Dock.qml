@@ -63,12 +63,15 @@ Item {
     root.pinnedIds = ids
   }
 
-  // New file wins whenever it has content; the legacy file only seeds an
-  // installation that has never written the new one.
+  // The new file wins whenever it EXISTS — even empty (an emptied pin
+  // file means "no pins", it must not resurrect the legacy seed list).
+  // The legacy file only seeds an installation that has never written
+  // the new one.
   property string pinnedRaw: ""
+  property bool pinnedFileExists: false
   property string legacyPinnedRaw: ""
   function applyPinned() {
-    root.loadPinned(root.pinnedRaw.trim().length > 0 ? root.pinnedRaw : root.legacyPinnedRaw)
+    root.loadPinned(root.pinnedFileExists ? root.pinnedRaw : root.legacyPinnedRaw)
   }
 
   FileView {
@@ -77,9 +80,9 @@ Item {
     watchChanges: true
     atomicWrites: true
     printErrors: false
-    onLoaded: { root.pinnedRaw = text(); root.applyPinned() }
+    onLoaded: { root.pinnedRaw = text(); root.pinnedFileExists = true; root.applyPinned() }
     onFileChanged: reload()
-    onLoadFailed: { root.pinnedRaw = ""; root.applyPinned() }
+    onLoadFailed: { root.pinnedRaw = ""; root.pinnedFileExists = false; root.applyPinned() }
   }
 
   FileView {
@@ -99,6 +102,7 @@ Item {
     root.pinnedIds = ids // optimistic; the file watch confirms it
     var text = JSON.stringify(ids, null, 2) + "\n"
     root.pinnedRaw = text // the new file now owns the state
+    root.pinnedFileExists = true
     try {
       pinnedFile.setText(text)
     } catch (e) {
@@ -204,10 +208,18 @@ Item {
         var t = values[i]
         var key = String((t && t.appId) || "").toLowerCase()
         if (key.length === 0) continue
+        // Skip transients (dialogs parented to another toplevel) and
+        // desktop-portal helper windows — they aren't apps to the user.
+        var par = null
+        try { par = t.parent } catch (e2) {}
+        if (par) continue
+        if (key.indexOf("xdg-desktop-portal") === 0) continue
         if (!map[key]) map[key] = []
         map[key].push(t)
       }
-    } catch (e) {}
+    } catch (e) {
+      console.warn("dino.dock: rebuildRunning failed:", e)
+    }
     root.runningAppIds = map
   }
 
@@ -216,14 +228,53 @@ Item {
     function onValuesChanged() { root.rebuildRunning() }
   }
 
+  // Meaningful name tokens from a Chromium-style webapp app_id, e.g.
+  // "chrome-app.fastmail.com__mail-Default" -> ["fastmail"],
+  // "chrome-x.com__-Default" -> ["x"]. The second-level domain label is
+  // always included; other labels only when they're distinctive.
+  function webappTokens(appId) {
+    var s = String(appId || "").toLowerCase()
+    if (s.indexOf("chrome-") !== 0) return []
+    var host = s.slice(7).split("__")[0]
+    var parts = host.split(".")
+    var skip = { www: 1, app: 1, web: 1, mail: 1, com: 1, net: 1, org: 1, io: 1, dev: 1, co: 1 }
+    var out = []
+    if (parts.length >= 2) out.push(parts[parts.length - 2]) // SLD, always
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i].length > 2 && !skip[parts[i]] && out.indexOf(parts[i]) === -1) out.push(parts[i])
+    }
+    return out
+  }
+
+  // Precise entry <-> app_id match: exact desktop-entry id, then the
+  // entry's StartupWMClass, then webapp-token equality. Deliberately NO
+  // generic substring matching — "code" must not claim "code-oss", and
+  // short ids must not light the wrong pin's dot (review finding).
+  function entryMatchesAppId(entry, appId) {
+    if (!entry) return false
+    var key = String(appId || "").toLowerCase()
+    if (String(entry.id || "").toLowerCase() === key) return true
+    var sc = ""
+    try { sc = String(entry.startupClass || "") } catch (e) {}
+    if (sc.length > 0 && sc.toLowerCase() === key) return true
+    var toks = root.webappTokens(key)
+    if (toks.length > 0) {
+      var eid = String(entry.id || "").toLowerCase()
+      var ename = String(entry.name || "").toLowerCase()
+      for (var i = 0; i < toks.length; i++) {
+        if (eid === toks[i] || ename === toks[i]) return true
+      }
+    }
+    return false
+  }
+
   // The app_id key a pin's running windows live under, or "" if none.
   function runningKeyFor(pin) {
-    var needle1 = String(pin.id || "").toLowerCase()
-    var needle2 = pin.name ? String(pin.name).toLowerCase() : ""
+    var needle = String(pin.id || "").toLowerCase()
+    var entry = pin.entry || root.entryIndex[pin.id] || null
     for (var key in root.runningAppIds) {
-      if (key === needle1) return key
-      if (needle1.length > 0 && (key.indexOf(needle1) !== -1 || needle1.indexOf(key) !== -1)) return key
-      if (needle2.length > 0 && key.indexOf(needle2) !== -1) return key
+      if (key === needle) return key
+      if (root.entryMatchesAppId(entry, key)) return key
     }
     return ""
   }
@@ -255,20 +306,19 @@ Item {
     }
   }
 
-  // Best-effort desktop entry for a bare Wayland app_id (exact id first,
-  // then case-insensitive, then substring either way) — same spirit as
-  // runningKeyFor, in the other direction.
+  // Desktop entry for a bare Wayland app_id: Quickshell's own
+  // heuristicLookup first (exact id + StartupWMClass, the API this code
+  // used to reimplement worse), then the same precise matcher used for
+  // pins (covers webapp app_ids, whose entries carry no StartupWMClass).
   function entryForAppId(appId) {
+    try {
+      var e = DesktopEntries.heuristicLookup(String(appId))
+      if (e) return e
+    } catch (err) {}
     var idx = root.entryIndex
-    if (idx[appId]) return idx[appId]
-    var lower = String(appId).toLowerCase()
     var keys = Object.keys(idx)
     for (var i = 0; i < keys.length; i++) {
-      if (keys[i].toLowerCase() === lower) return idx[keys[i]]
-    }
-    for (i = 0; i < keys.length; i++) {
-      var k = keys[i].toLowerCase()
-      if (k.indexOf(lower) !== -1 || lower.indexOf(k) !== -1) return idx[keys[i]]
+      if (root.entryMatchesAppId(idx[keys[i]], appId)) return idx[keys[i]]
     }
     return null
   }
@@ -331,8 +381,16 @@ Item {
   // any substring of the target's manufacturer/model/connector name,
   // case-insensitive (e.g. "Odyssey G50F", or just "DP-2"). Absent or
   // empty file = no preference, use the first enumerated screen.
-  readonly property string monitorPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/dino.dock/monitor.json"
+  // Same out-of-plugin-dir rule as pins and settings: editing a file
+  // inside the plugin checkout remounts the whole plugin (and dirties the
+  // git tree `omarchy plugin update` pulls into). The in-plugin
+  // monitor.json is still read as a legacy fallback.
+  readonly property string monitorPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/dino.dock.monitor.json"
+  readonly property string legacyMonitorPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/dino.dock/monitor.json"
   property string monitorMatch: ""
+  property string monitorRaw: ""
+  property bool monitorFileExists: false
+  property string legacyMonitorRaw: ""
 
   function loadMonitorMatch(rawText) {
     var text = String(rawText || "").trim()
@@ -346,14 +404,28 @@ Item {
     }
   }
 
+  function applyMonitor() {
+    root.loadMonitorMatch(root.monitorFileExists ? root.monitorRaw : root.legacyMonitorRaw)
+  }
+
   FileView {
     id: monitorFile
     path: root.monitorPath
     watchChanges: true
     printErrors: false
-    onLoaded: root.loadMonitorMatch(text())
+    onLoaded: { root.monitorRaw = text(); root.monitorFileExists = true; root.applyMonitor() }
     onFileChanged: reload()
-    onLoadFailed: root.loadMonitorMatch("")
+    onLoadFailed: { root.monitorRaw = ""; root.monitorFileExists = false; root.applyMonitor() }
+  }
+
+  FileView {
+    id: legacyMonitorFile
+    path: root.legacyMonitorPath
+    watchChanges: true
+    printErrors: false
+    onLoaded: { root.legacyMonitorRaw = text(); root.applyMonitor() }
+    onFileChanged: reload()
+    onLoadFailed: { root.legacyMonitorRaw = ""; root.applyMonitor() }
   }
 
   function screenMatches(screen) {
@@ -529,11 +601,15 @@ Item {
         borderSpec: Border.flat(Util.alpha(Color.popups.border, 0.35), 1)
         // Vertical glass sheen: catches light at the top, settles darker at
         // the base. Derived from the theme background so it follows theme
-        // switches instead of hardcoding a palette.
+        // switches instead of hardcoding a palette. On light themes the
+        // lighten/sheen amounts are dialed way down — lightening an
+        // already-light background just washes the capsule to white
+        // (review finding).
+        readonly property bool lightTheme: Color.popups.background.hslLightness > 0.5
         gradient: Gradient {
-          GradientStop { position: 0.0; color: Util.alpha(Qt.lighter(Color.popups.background, 2.1), 0.97) }
+          GradientStop { position: 0.0; color: Util.alpha(Qt.lighter(Color.popups.background, cardBg.lightTheme ? 1.06 : 2.1), 0.97) }
           GradientStop { position: 0.45; color: Util.alpha(Color.popups.background, 0.97) }
-          GradientStop { position: 1.0; color: Util.alpha(Qt.darker(Color.popups.background, 1.5), 0.98) }
+          GradientStop { position: 1.0; color: Util.alpha(Qt.darker(Color.popups.background, cardBg.lightTheme ? 1.10 : 1.5), 0.98) }
         }
 
         // Additive white sheen over the top half — the base color is dark
@@ -544,8 +620,8 @@ Item {
           anchors.fill: parent
           radius: parent.radius
           gradient: Gradient {
-            GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, 0.16) }
-            GradientStop { position: 0.5; color: Qt.rgba(1, 1, 1, 0.02) }
+            GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, cardBg.lightTheme ? 0.05 : 0.16) }
+            GradientStop { position: 0.5; color: Qt.rgba(1, 1, 1, cardBg.lightTheme ? 0.01 : 0.02) }
             GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.0) }
           }
         }
@@ -695,15 +771,22 @@ Item {
                 // a generic app tile beats an invisible one.
                 readonly property string genericPath: "file:///usr/share/icons/Papirus/64x64/apps/application-default-icon.svg"
 
-                source: icon.papirusPath
+                // Staged fallback that KEEPS source a binding: assigning
+                // source imperatively in onStatusChanged broke the binding,
+                // so a recycled delegate whose modelData changed kept the
+                // previous app's picture (review finding). stage resets
+                // whenever the candidate list (i.e. the icon) changes.
+                readonly property var candidates: {
+                  var out = [icon.papirusPath]
+                  if (icon.themedPath.length > 0) out.push(icon.themedPath)
+                  out.push(icon.genericPath)
+                  return out
+                }
+                property int stage: 0
+                onCandidatesChanged: stage = 0
+                source: candidates[Math.min(stage, candidates.length - 1)]
                 onStatusChanged: {
-                  if (status !== Image.Error) return
-                  var s = source.toString()
-                  if (s === icon.papirusPath && icon.themedPath.length > 0 && icon.themedPath !== s) {
-                    source = icon.themedPath
-                  } else if (s !== icon.genericPath) {
-                    source = icon.genericPath
-                  }
+                  if (status === Image.Error && stage < candidates.length - 1) stage += 1
                 }
               }
 
@@ -725,9 +808,13 @@ Item {
               }
             }
 
+            // A child of the scaled tile, so the clickable area follows the
+            // magnified pixels instead of staying the unscaled square
+            // (review finding).
             MouseArea {
               id: slotMa
-              anchors.fill: tile
+              parent: tile
+              anchors.fill: parent
               visible: !slot.isSep
               enabled: !slot.isSep
               hoverEnabled: true
@@ -758,15 +845,23 @@ Item {
                   dockCard.dragIndex = slot.index
                 }
                 if (didDrag) {
-                  dockCard.dragTargetIndex = dockCard.insertionIndexAt(iconRow.x + slot.x + mouse.x)
+                  // Map through the (possibly scaled) tile so drag targeting
+                  // stays accurate under magnification.
+                  dockCard.dragTargetIndex = dockCard.insertionIndexAt(
+                    slotMa.mapToItem(dockCard, mouse.x, 0).x)
                 }
               }
               onReleased: {
-                if (didDrag) dockCard.finishDrag()
+                if (didDrag) {
+                  dockCard.finishDrag()
+                  // Cleared AFTER any synthesized click delivers, so a drag
+                  // released outside the slot doesn't leave didDrag armed to
+                  // swallow the next real click (review finding).
+                  Qt.callLater(function() { slotMa.didDrag = false })
+                }
               }
               onClicked: mouse => {
                 if (didDrag) {
-                  didDrag = false
                   return
                 }
                 if (mouse.button === Qt.RightButton) {
@@ -909,7 +1004,10 @@ Item {
         width: rowWidth + Style.space(8)
         height: menuCol.implicitHeight + Style.space(8)
         x: Math.max(0, Math.min(dockCard.menuX - width / 2, dockCard.width - width))
-        y: dockCard.height - dockCard.cardHeight - height - Style.space(8)
+        // Clamped so a long jump list can't run off the top of the screen
+        // (dockCard.y is the distance to the screen top in these coords).
+        y: Math.max(Style.space(4) - dockCard.y,
+                    dockCard.height - dockCard.cardHeight - height - Style.space(8))
 
         MouseArea {
           id: menuHover
