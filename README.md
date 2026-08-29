@@ -6,7 +6,7 @@ bounce, running-app indicators, and a glassy capsule look. Built as a
 native `omarchy-shell` plugin (same tech as the bar/OSD), so it's themed
 automatically and survives theme switches.
 
-![Floating Dock](screenshot.png)
+![Floating Dock](screenshot.jpg)
 
 ## Install
 
