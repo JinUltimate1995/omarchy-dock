@@ -6,7 +6,7 @@ import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
 
-// Apple-style floating dock. Mounted at startup (kind: "panel",
+// Floating dock, macOS-style behavior. Mounted at startup (kind: "panel",
 // keepLoaded: true) and stays visible permanently — there is no
 // open/close cycle like OSD or the menu, it just sits at the bottom of
 // the screen.

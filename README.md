@@ -1,6 +1,6 @@
 # Floating Dock
 
-An Apple-style floating dock for [Omarchy](https://omarchy.org) — a
+A floating dock for [Omarchy](https://omarchy.org) — a
 mouse-first way to launch, switch, and manage apps on a keyboard-first
 desktop.
 
@@ -48,13 +48,13 @@ Everything above is driven by stable Wayland protocols
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/randomchaos7800-hub/omarchy-apple-dock.git --enable
+omarchy plugin add https://github.com/randomchaos7800-hub/omarchy-dock.git --enable
 ```
 
 Or manually:
 
 ```bash
-git clone https://github.com/randomchaos7800-hub/omarchy-apple-dock.git ~/.config/omarchy/plugins/dino.dock
+git clone https://github.com/randomchaos7800-hub/omarchy-dock.git ~/.config/omarchy/plugins/dino.dock
 omarchy plugin enable dino.dock
 ```
 
