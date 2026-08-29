@@ -26,7 +26,15 @@ Item {
 
   // ------------------------------------------------------------ pinned apps
 
-  readonly property string pinnedPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/dino.dock/pinned.json"
+  // Pin state lives OUTSIDE the plugin directory on purpose: the shell's
+  // plugin registry watches ~/.config/omarchy/plugins/<id>/ and reloads the
+  // whole plugin when anything in it changes — writing pinned.json in there
+  // from the right-click menu would tear the dock down mid-click. The
+  // legacy in-plugin pinned.json is still read as a fallback seed, so
+  // existing setups keep their pins; the first pin/unpin from the dock
+  // writes the new file and it takes over from then on.
+  readonly property string pinnedPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/dino.dock.pinned.json"
+  readonly property string legacyPinnedPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/dino.dock/pinned.json"
   readonly property int maxPinned: 20
 
   property var pinnedIds: []    // ordered list of desktop-entry ids
@@ -55,14 +63,62 @@ Item {
     root.pinnedIds = ids
   }
 
+  // New file wins whenever it has content; the legacy file only seeds an
+  // installation that has never written the new one.
+  property string pinnedRaw: ""
+  property string legacyPinnedRaw: ""
+  function applyPinned() {
+    root.loadPinned(root.pinnedRaw.trim().length > 0 ? root.pinnedRaw : root.legacyPinnedRaw)
+  }
+
   FileView {
     id: pinnedFile
     path: root.pinnedPath
     watchChanges: true
+    atomicWrites: true
     printErrors: false
-    onLoaded: root.loadPinned(text())
+    onLoaded: { root.pinnedRaw = text(); root.applyPinned() }
     onFileChanged: reload()
-    onLoadFailed: root.loadPinned("")
+    onLoadFailed: { root.pinnedRaw = ""; root.applyPinned() }
+  }
+
+  FileView {
+    id: legacyPinnedFile
+    path: root.legacyPinnedPath
+    watchChanges: true
+    printErrors: false
+    onLoaded: { root.legacyPinnedRaw = text(); root.applyPinned() }
+    onFileChanged: reload()
+    onLoadFailed: { root.legacyPinnedRaw = ""; root.applyPinned() }
+  }
+
+  // Pin management from the dock itself (right-click menu). Writes go to
+  // the same pinned.json a user could hand-edit — the FileView watch then
+  // reloads it, so the dock, the file, and any open editor all agree.
+  function writePinned(ids) {
+    root.pinnedIds = ids // optimistic; the file watch confirms it
+    var text = JSON.stringify(ids, null, 2) + "\n"
+    root.pinnedRaw = text // the new file now owns the state
+    try {
+      pinnedFile.setText(text)
+    } catch (e) {
+      console.warn("dino.dock: pinned.json write failed:", e)
+    }
+  }
+
+  function pinApp(entryId) {
+    var id = String(entryId || "").trim()
+    if (id.length === 0 || root.pinnedIds.indexOf(id) !== -1) return
+    if (root.pinnedIds.length >= root.maxPinned) {
+      console.warn("dino.dock: pin cap (" + root.maxPinned + ") reached, not pinning " + id)
+      return
+    }
+    root.writePinned(root.pinnedIds.concat([id]))
+  }
+
+  function unpinApp(id) {
+    var ids = root.pinnedIds.filter(function(x) { return x !== id })
+    if (ids.length !== root.pinnedIds.length) root.writePinned(ids)
   }
 
   function rebuildEntryIndex() {
@@ -340,6 +396,10 @@ Item {
       // item) still covers them while they're up there.
       readonly property int headroom: Math.round(iconSize * (magStrength + 0.35))
 
+      // ---- right-click pin menu ----
+      property var menuData: null // modelData of the icon the menu is open for
+      property real menuX: 0
+
       // ---- hover magnification ----
       property real hoverX: -100000
       readonly property real magRadius: iconSize * 2.1
@@ -396,7 +456,10 @@ Item {
         hoverEnabled: true
         acceptedButtons: Qt.NoButton
         onPositionChanged: dockCard.hoverX = mouseX
-        onExited: dockCard.hoverX = -100000
+        onExited: {
+          dockCard.hoverX = -100000
+          dockCard.menuData = null
+        }
       }
 
       Row {
@@ -565,10 +628,22 @@ Item {
               visible: !slot.isSep
               enabled: !slot.isSep
               hoverEnabled: true
+              acceptedButtons: Qt.LeftButton | Qt.RightButton
               cursorShape: Qt.PointingHandCursor
               onEntered: slot.hovered = true
               onExited: slot.hovered = false
-              onClicked: {
+              onClicked: mouse => {
+                if (mouse.button === Qt.RightButton) {
+                  // Toggle the pin menu for this icon.
+                  if (dockCard.menuData === slot.modelData) {
+                    dockCard.menuData = null
+                  } else {
+                    dockCard.menuX = slot.slotCenterX
+                    dockCard.menuData = slot.modelData
+                  }
+                  return
+                }
+                dockCard.menuData = null
                 // Bounce is a "launching" cue — focusing an already-running
                 // window just switches to it, no theatrics (macOS again).
                 if (!slot.isRunning) bounceAnim.start()
@@ -579,7 +654,9 @@ Item {
             Rectangle {
               id: tooltip
               visible: opacity > 0
-              opacity: slot.hovered ? 1 : 0
+              // Suppressed while the pin menu is up — they occupy the same
+              // spot above the icon.
+              opacity: (slot.hovered && dockCard.menuData === null) ? 1 : 0
               Behavior on opacity { NumberAnimation { duration: 120 } }
               radius: Style.space(6)
               color: Util.alpha(Color.tooltip.background, 0.95)
@@ -598,6 +675,68 @@ Item {
                 font.pixelSize: Style.font.bodySmall
               }
             }
+          }
+        }
+      }
+
+      // ---- right-click pin menu ----
+      //
+      // One action per target: unpin a pinned app, pin a running extra
+      // (via its resolved desktop entry). Kept inside dockCard's bounds
+      // (it fits in the magnification headroom) so the existing input
+      // mask covers it. Closes on action, on left-click anywhere in the
+      // dock, on right-click toggle, or when the pointer leaves the dock.
+      Rectangle {
+        id: contextMenu
+        readonly property var menuData: dockCard.menuData
+        readonly property bool targetPinned: menuData !== null && menuData.isExtra !== true
+        readonly property string pinId: {
+          if (menuData === null) return ""
+          if (menuData.isExtra === true)
+            return (menuData.entry && menuData.entry.id) ? String(menuData.entry.id) : ""
+          return String(menuData.id || "")
+        }
+        readonly property bool actionable: targetPinned || pinId.length > 0
+
+        visible: menuData !== null
+        z: 100
+        radius: Style.space(8)
+        color: Util.alpha(Color.popups.background, 0.98)
+        border.color: Util.alpha(Color.popups.border, 0.5)
+        border.width: 1
+        width: menuLabel.implicitWidth + Style.space(28)
+        height: menuLabel.implicitHeight + Style.space(16)
+        x: Math.max(0, Math.min(dockCard.menuX - width / 2, dockCard.width - width))
+        y: Math.max(0, dockCard.height - dockCard.cardHeight - height - Style.space(8))
+
+        Rectangle {
+          anchors.fill: parent
+          anchors.margins: Style.space(3)
+          radius: Style.space(6)
+          color: menuMouse.containsMouse && contextMenu.actionable ? Style.hoverFill : "transparent"
+        }
+
+        Text {
+          id: menuLabel
+          anchors.centerIn: parent
+          text: contextMenu.targetPinned
+            ? "Unpin from Dock"
+            : (contextMenu.pinId.length > 0 ? "Pin to Dock" : "No launcher to pin")
+          color: contextMenu.actionable ? Color.popups.text : Util.alpha(Color.popups.text, 0.5)
+          font.family: Style.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+
+        MouseArea {
+          id: menuMouse
+          anchors.fill: parent
+          hoverEnabled: true
+          enabled: contextMenu.actionable
+          cursorShape: contextMenu.actionable ? Qt.PointingHandCursor : Qt.ArrowCursor
+          onClicked: {
+            if (contextMenu.targetPinned) root.unpinApp(contextMenu.pinId)
+            else root.pinApp(contextMenu.pinId)
+            dockCard.menuData = null
           }
         }
       }
