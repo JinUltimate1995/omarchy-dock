@@ -280,25 +280,33 @@ can't light the wrong pin.
 - **Browser or terminal floats over everything** — Omarchy's defaults
   float Chromium-based browsers and center-launch foot as a fixed
   quick-prompt. Floating windows always stack above tiled ones, which
-  feels broken if you expect Windows/macOS behavior. Tile them by
-  declaring user rules *before* Omarchy's defaults load in
-  `~/.config/hypr/hyprland.lua` (rule order is first-match-wins):
+  feels broken if you expect Windows/macOS behavior. Tile them in
+  `~/.config/hypr/hyprland.lua` — load the helpers first (they define
+  the `o` rule API), declare the browser rule before the defaults, and
+  strip foot's floating tag *after* them (foot also requests its own
+  700x500 size, which Hyprland honors by floating; `tile = true`
+  overrides that):
 
   ```lua
   dofile((os.getenv("OMARCHY_PATH") or "/usr/share/omarchy") .. "/default/hypr/bootstrap.lua")
+  require("default.hypr.helpers")   -- defines `o` before your rules
 
+  -- Browsers tile like every other app.
   o.window({ tag = "chromium-based-browser" }, { tile = true, float = false })
-  o.window("org.codeberg.dnkl.foot", { float = false })
 
   require("default.hypr.omarchy")
   -- ... rest of your config ...
+
+  -- foot: strip Omarchy's floating quick-prompt tag, then force tiling.
+  o.window("foot", { tag = "-floating-window" })
+  o.window("foot", { tile = true })
   ```
 
   On tiling window managers, minimize is the only concept with no
   Windows/Mac equivalent — this dock fakes it with a hidden scratchpad
   workspace, and power users usually just never minimize (they switch
   workspaces instead). Omarchy floats foot quick-prompts on purpose;
-  the rule above opts you into a normal terminal.
+  the rules above opt you into a normal terminal.
 - **Dock is on the wrong monitor** — set
   `~/.config/omarchy/dino.dock.monitor.json` (see above).
 - **Dock seems gone** — auto-hide is probably on; push the pointer to
