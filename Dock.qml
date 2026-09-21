@@ -48,7 +48,31 @@ Item {
       root.autohide = s.autohide === true
       var t = parseInt(s.popupTimeoutMs, 10)
       if (isFinite(t) && t >= 1000) root.popupTimeoutMs = t
+      // TEMPORARY screenshot hooks (removed after README shots)
+      root.debugLauncher = s.debugLauncher === true
+      if (s.debugMenu === true) menuDebugTimer.restart()
     } catch (e) {}
+  }
+
+  // TEMPORARY screenshot hooks (removed after README shots)
+  property bool debugLauncher: false
+  Timer {
+    id: menuDebugTimer
+    interval: 2000
+    onTriggered: {
+      var m = root.dockModel
+      for (var i = 0; i < m.length; i++) {
+        if (m[i] && m[i].running === true) {
+          dockCard.menuX = 960
+          dockCard.menuData = m[i]
+          return
+        }
+      }
+      if (m.length > 0) {
+        dockCard.menuX = 960
+        dockCard.menuData = m[0]
+      }
+    }
   }
 
   FileView {
