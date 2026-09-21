@@ -277,6 +277,28 @@ can't light the wrong pin.
   `/usr/bin/python3 ~/.config/omarchy/plugins/dino.dock/dock_helper.py`
   with no arguments should print its usage. `grim` must be installed
   (it ships with Omarchy) for the hover previews.
+- **Browser or terminal floats over everything** — Omarchy's defaults
+  float Chromium-based browsers and center-launch foot as a fixed
+  quick-prompt. Floating windows always stack above tiled ones, which
+  feels broken if you expect Windows/macOS behavior. Tile them by
+  declaring user rules *before* Omarchy's defaults load in
+  `~/.config/hypr/hyprland.lua` (rule order is first-match-wins):
+
+  ```lua
+  dofile((os.getenv("OMARCHY_PATH") or "/usr/share/omarchy") .. "/default/hypr/bootstrap.lua")
+
+  o.window({ tag = "chromium-based-browser" }, { tile = true, float = false })
+  o.window("org.codeberg.dnkl.foot", { float = false })
+
+  require("default.hypr.omarchy")
+  -- ... rest of your config ...
+  ```
+
+  On tiling window managers, minimize is the only concept with no
+  Windows/Mac equivalent — this dock fakes it with a hidden scratchpad
+  workspace, and power users usually just never minimize (they switch
+  workspaces instead). Omarchy floats foot quick-prompts on purpose;
+  the rule above opts you into a normal terminal.
 - **Dock is on the wrong monitor** — set
   `~/.config/omarchy/dino.dock.monitor.json` (see above).
 - **Dock seems gone** — auto-hide is probably on; push the pointer to
