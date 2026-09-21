@@ -8,17 +8,19 @@ launcher, and a taskbar that behaves the way you already expect. No
 keybind memorization required to get around.
 
 Built as a native `omarchy-shell` plugin, the same technology as
+Built as a native `omarchy-shell` plugin, the same technology as
 Omarchy's bar and OSD, so it follows your theme automatically and
 survives theme switches without configuration.
 
 ![Floating Dock](screenshot.jpg)
 
-![Window preview on hover](docs/screenshots/menu.png)
+| Hover preview | Right-click menu |
+|:---:|:---:|
+| ![preview](docs/screenshots/preview.png) | ![menu](docs/screenshots/menu_zoom.png) |
 
 ## Features
 
 - **Pinned launchers** in a glassy capsule, with hover magnification and
-  a launch bounce.
 - **Every running app is in the dock**, pinned or not — unpinned apps
   appear to the right of a divider, macOS style, so any open program is
   one click away no matter how it was launched.
