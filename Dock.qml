@@ -418,6 +418,7 @@ Item {
   // screenshot (grim) and refresh on a short timer — cheap, no GPU loop.
   readonly property string previewPath: "/tmp/dock-preview-" + (Quickshell.env("USER") || "u") + ".png"
   property var previewTarget: null   // { x, y, w, h } | null
+  property string previewTargetState: "live"   // live | minimized | elsewhere
   property int previewSeq: 0
   property var previewToplevels: null
 
@@ -443,9 +444,18 @@ Item {
       }
       var best = null
       var bestArea = 0
+      var anyRunning = false
+      var anyHidden = false
       for (i = 0; i < d.clients.length; i++) {
         var c = d.clients[i]
-        if (!c.mapped || c.hidden) continue
+        if (!c.mapped || c.hidden) {
+          if (c.hidden && idset[String(c.class || "").toLowerCase()]) anyHidden = true
+          continue
+        }
+        var ckey0 = String(c.class || "").toLowerCase()
+        if (idset[ckey0]) anyRunning = true
+        // scratchpad-minimized windows park on ws -98 and report hidden=false
+        if (c.workspace === -98 && idset[ckey0]) anyHidden = true
         if (c.workspace !== activeWs) continue
         var ckey = String(c.class || "").toLowerCase()
         if (!(idset[ckey])) continue
@@ -456,6 +466,8 @@ Item {
         if (area > bestArea) { bestArea = area; best = { x: c.at[0], y: c.at[1], w: w, h: h } }
       }
       root.previewTarget = best
+      root.previewTargetState = (best !== null) ? "live"
+        : (anyHidden ? "minimized" : (anyRunning ? "elsewhere" : "none"))
       if (best !== null) root.grabPreview()
     } catch (e) { root.previewTarget = null }
   }
@@ -681,9 +693,12 @@ Item {
     WlrLayershell.namespace: "omarchy-dock"
     // Top placement rides the Top layer so the compositor keeps Omarchy's bar
     // at the very edge and stacks the dock right below it (verified ordering).
+    // Side placements (left/right) float macOS-style: reserving a full-height
+    // strip would cut a hole into Omarchy's bar next to the tray/battery.
     WlrLayershell.layer: root.position === "top" ? WlrLayer.Top : WlrLayer.Bottom
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
-    exclusionMode: (root.autohide && !root.revealed) ? ExclusionMode.Ignore : ExclusionMode.Auto
+    exclusionMode: (root.autohide && !root.revealed) ? ExclusionMode.Ignore
+      : (root.isHorizontal ? ExclusionMode.Auto : ExclusionMode.Ignore)
 
     // Input is only the dock card itself — popups live in the popup window.
     mask: Region {
@@ -1436,10 +1451,17 @@ Item {
 
           Text {
             anchors.centerIn: parent
+            width: parent.width - Style.space(24)
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
             visible: !previewShot.visible
-            text: (previewCard.tls && previewCard.tls.length > 1)
-              ? previewCard.tls.length + " windows"
-              : "window preview"
+            text: root.previewTargetState === "minimized"
+              ? "Minimized — click to restore"
+              : (root.previewTargetState === "elsewhere"
+                ? "On another workspace — click to bring it here"
+                : ((previewCard.tls && previewCard.tls.length > 1)
+                  ? previewCard.tls.length + " windows"
+                  : "window preview"))
             color: Util.alpha(Color.popups.text, 0.7)
             font.family: Style.fontFamily
             font.pixelSize: Style.font.bodySmall
