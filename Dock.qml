@@ -6,39 +6,116 @@ import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
 
-// Floating dock, macOS-style behavior. Mounted at startup (kind: "panel",
-// keepLoaded: true) and stays visible permanently — there is no
-// open/close cycle like OSD or the menu, it just sits at the bottom of
-// the screen.
+// Flat taskbar dock — full Windows/Mac behavior. No magnification, no bounce.
+// Bottom / left / right / top placements. The dock reserves its strip; the
+// interactive popups (tooltip, preview card, jump menu, launcher) live in
+// Top/Overlay-layer windows so they float above app windows.
 //
-// Pinned apps live in pinned.json next to this file (hand-edited, see
-// README.md), not in shell.json — a list of up to 20 desktop-entry IDs is
-// awkward to carry as bar-style inline settings, and a dedicated file is
-// easier to hand-edit / diff / back up.
+// Top placement: the dock maps on the Top layer (same as Omarchy's bar), so
+// the compositor keeps the bar at the very edge and docks below it.
+//
+// Left-click: launch, focus, cycle, or un-minimize (restores scratchpad windows).
+// Right-click: jump menu — Minimize, Maximize/Restore, window list with close
+// buttons, New Window, Close All, Force Close, Pin/Unpin.
+// Hover a running app: live window preview with title + Minimize/Maximize/Close
+// (plus Pin for unpinned apps) — a snapshot of the real window refreshed live.
+// Hover a launcher: name tooltip. Drag pinned apps to reorder.
+// Apps button: Launchpad-style app grid with instant search (Esc closes).
+// Running apps get a rounded "shell" ring instead of a dot.
+// Hover popups are force-closed after popupTimeoutMs (default 30 s).
 Item {
   id: root
 
-  // Injected by omarchy-shell when this panel plugin is mounted.
   property var shell: null
   property string omarchyPath: ""
-
   readonly property var appLibrary: root.shell ? root.shell.appLibrary : null
+
+  // ------------------------------------------------------------ settings
+
+  readonly property string settingsPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/dino.dock.settings.json"
+  // position: "bottom" | "top" | "left" | "right"
+  property string position: "bottom"
+  // autohide: dock hides; a thin edge strip reveals it on pointer contact
+  property bool autohide: false
+  // hover popups (tooltip, preview, menu) are force-closed after this long
+  property int popupTimeoutMs: 30000
+
+  function applySettings(rawText) {
+    try {
+      var s = JSON.parse(String(rawText || "{}"))
+      var p = String(s.position || "bottom").toLowerCase()
+      if (p === "bottom" || p === "top" || p === "left" || p === "right") root.position = p
+      root.autohide = s.autohide === true
+      var t = parseInt(s.popupTimeoutMs, 10)
+      if (isFinite(t) && t >= 1000) root.popupTimeoutMs = t
+    } catch (e) {}
+  }
+
+  FileView {
+    id: settingsFile
+    path: root.settingsPath
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.applySettings(text())
+    onFileChanged: reload()
+    onLoadFailed: {}
+  }
+
+  readonly property bool isHorizontal: root.position === "bottom" || root.position === "top"
+  readonly property bool isSide: !root.isHorizontal
+
+  // ------------------------------------------------------------ Omarchy bar inset (top placement)
+
+  // With top placement the dock maps on the Top layer and the compositor keeps
+  // the bar at the edge; the popup window needs the bar's height to place its
+  // content below the dock card. Probed from hyprctl layers -j.
+  property int topInset: 0
+
+  Process {
+    id: barProbe
+    command: ["hyprctl", "layers", "-j"]
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          var d = JSON.parse(this.text)
+          var best = 0
+          for (var mon in d) {
+            var levels = d[mon].levels || {}
+            for (var lvl in levels) {
+              if (String(lvl) !== "2") continue
+              var arr = levels[lvl]
+              for (var i = 0; i < arr.length; i++) {
+                var s = arr[i]
+                if (s.namespace === "omarchy-bar" && s.y === 0 && s.h > 0 && s.h < 200)
+                  best = Math.max(best, s.h)
+              }
+            }
+          }
+          root.topInset = best
+        } catch (e) { root.topInset = 0 }
+      }
+    }
+  }
+
+  onPositionChanged: {
+    if (position === "top") barProbe.running = true
+  }
+
+  Component.onCompleted: {
+    root.rebuildEntryIndex()
+    root.rebuildRunning()
+    if (root.appLibrary) root.appLibrary.refreshIcons()
+    barProbe.running = true
+  }
 
   // ------------------------------------------------------------ pinned apps
 
-  // Pin state lives OUTSIDE the plugin directory on purpose: the shell's
-  // plugin registry watches ~/.config/omarchy/plugins/<id>/ and reloads the
-  // whole plugin when anything in it changes — writing pinned.json in there
-  // from the right-click menu would tear the dock down mid-click. The
-  // legacy in-plugin pinned.json is still read as a fallback seed, so
-  // existing setups keep their pins; the first pin/unpin from the dock
-  // writes the new file and it takes over from then on.
   readonly property string pinnedPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/dino.dock.pinned.json"
   readonly property string legacyPinnedPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/dino.dock/pinned.json"
   readonly property int maxPinned: 20
 
-  property var pinnedIds: []    // ordered list of desktop-entry ids
-  property var entryIndex: ({}) // desktop-entry id -> DesktopEntries entry object
+  property var pinnedIds: []
+  property var entryIndex: ({})
 
   function loadPinned(rawText) {
     var text = String(rawText || "").trim()
@@ -52,21 +129,12 @@ Item {
             if (id.length > 0) ids.push(id)
           }
         }
-      } catch (e) {
-        console.warn("dino.dock: pinned.json parse failed:", e)
-      }
+      } catch (e) {}
     }
-    if (ids.length > root.maxPinned) {
-      console.warn("dino.dock: " + ids.length + " pinned apps configured, showing the first " + root.maxPinned)
-      ids = ids.slice(0, root.maxPinned)
-    }
+    if (ids.length > root.maxPinned) ids = ids.slice(0, root.maxPinned)
     root.pinnedIds = ids
   }
 
-  // The new file wins whenever it EXISTS — even empty (an emptied pin
-  // file means "no pins", it must not resurrect the legacy seed list).
-  // The legacy file only seeds an installation that has never written
-  // the new one.
   property string pinnedRaw: ""
   property bool pinnedFileExists: false
   property string legacyPinnedRaw: ""
@@ -95,28 +163,18 @@ Item {
     onLoadFailed: { root.legacyPinnedRaw = ""; root.applyPinned() }
   }
 
-  // Pin management from the dock itself (right-click menu). Writes go to
-  // the same pinned.json a user could hand-edit — the FileView watch then
-  // reloads it, so the dock, the file, and any open editor all agree.
   function writePinned(ids) {
-    root.pinnedIds = ids // optimistic; the file watch confirms it
+    root.pinnedIds = ids
     var text = JSON.stringify(ids, null, 2) + "\n"
-    root.pinnedRaw = text // the new file now owns the state
+    root.pinnedRaw = text
     root.pinnedFileExists = true
-    try {
-      pinnedFile.setText(text)
-    } catch (e) {
-      console.warn("dino.dock: pinned.json write failed:", e)
-    }
+    try { pinnedFile.setText(text) } catch (e) {}
   }
 
   function pinApp(entryId) {
     var id = String(entryId || "").trim()
     if (id.length === 0 || root.pinnedIds.indexOf(id) !== -1) return
-    if (root.pinnedIds.length >= root.maxPinned) {
-      console.warn("dino.dock: pin cap (" + root.maxPinned + ") reached, not pinning " + id)
-      return
-    }
+    if (root.pinnedIds.length >= root.maxPinned) return
     root.writePinned(root.pinnedIds.concat([id]))
   }
 
@@ -125,46 +183,11 @@ Item {
     if (ids.length !== root.pinnedIds.length) root.writePinned(ids)
   }
 
-  // ------------------------------------------------------------ settings
-
-  // Same out-of-plugin-dir rule as the pin file (the registry reload
-  // problem). Currently one knob: {"autohide": false} to keep the dock
-  // always visible.
-  readonly property string settingsPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/dino.dock.settings.json"
-  property bool autohide: true
-
-  function loadSettings(rawText) {
-    var v = true
-    try {
-      var parsed = JSON.parse(String(rawText || ""))
-      if (parsed && typeof parsed.autohide === "boolean") v = parsed.autohide
-    } catch (e) {}
-    root.autohide = v
-  }
-
-  FileView {
-    id: settingsFile
-    path: root.settingsPath
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.loadSettings(text())
-    onFileChanged: reload()
-    onLoadFailed: root.loadSettings("")
-  }
-
-  // Auto-hide state. The dock slides below the screen edge when nothing
-  // needs it; a 4px reveal strip (separate tiny layer surface, only
-  // mapped while hidden) brings it back when the pointer hits the bottom
-  // of the screen — the macOS/taskbar autohide contract.
-  property bool dockHidden: false
-  onAutohideChanged: if (!autohide) dockHidden = false
-
   function rebuildEntryIndex() {
     var idx = {}
     var values = (typeof DesktopEntries !== "undefined" && DesktopEntries.applications) ? DesktopEntries.applications.values : []
     for (var i = 0; i < values.length; i++) {
-      var e = values[i]
-      if (e && e.id) idx[String(e.id)] = e
+      if (values[i] && values[i].id) idx[String(values[i].id)] = values[i]
     }
     root.entryIndex = idx
   }
@@ -174,30 +197,18 @@ Item {
     function onValuesChanged() { root.rebuildEntryIndex() }
   }
 
-  // {id, entry, name, icon} per pinned slot, resolved against whatever
-  // desktop entries currently exist. An id with no matching entry still
-  // renders (fallback icon, id as its label) rather than silently vanishing,
-  // so a typo in pinned.json is visible instead of just missing.
   readonly property var resolvedPins: {
     var out = []
     for (var i = 0; i < root.pinnedIds.length; i++) {
       var id = root.pinnedIds[i]
       var entry = root.entryIndex[id] || null
-      out.push({
-        id: id,
-        entry: entry,
-        name: entry ? String(entry.name || id) : id,
-        icon: entry ? entry.icon : id
-      })
+      out.push({ id: id, entry: entry, name: entry ? String(entry.name || id) : id, icon: entry ? entry.icon : id })
     }
     return out
   }
 
   // ------------------------------------------------------------ running apps
 
-  // Lowercased Wayland app_id -> [toplevels]. Heuristic matching (see
-  // README): Wayland gives no reliable app_id <-> .desktop-id mapping, so
-  // this is a best-effort match, not a guarantee.
   property var runningAppIds: ({})
 
   function rebuildRunning() {
@@ -208,18 +219,12 @@ Item {
         var t = values[i]
         var key = String((t && t.appId) || "").toLowerCase()
         if (key.length === 0) continue
-        // Skip transients (dialogs parented to another toplevel) and
-        // desktop-portal helper windows — they aren't apps to the user.
-        var par = null
-        try { par = t.parent } catch (e2) {}
-        if (par) continue
+        try { if (t.parent) continue } catch (e) {}
         if (key.indexOf("xdg-desktop-portal") === 0) continue
         if (!map[key]) map[key] = []
         map[key].push(t)
       }
-    } catch (e) {
-      console.warn("dino.dock: rebuildRunning failed:", e)
-    }
+    } catch (e) {}
     root.runningAppIds = map
   }
 
@@ -228,10 +233,6 @@ Item {
     function onValuesChanged() { root.rebuildRunning() }
   }
 
-  // Meaningful name tokens from a Chromium-style webapp app_id, e.g.
-  // "chrome-app.fastmail.com__mail-Default" -> ["fastmail"],
-  // "chrome-x.com__-Default" -> ["x"]. The second-level domain label is
-  // always included; other labels only when they're distinctive.
   function webappTokens(appId) {
     var s = String(appId || "").toLowerCase()
     if (s.indexOf("chrome-") !== 0) return []
@@ -239,24 +240,18 @@ Item {
     var parts = host.split(".")
     var skip = { www: 1, app: 1, web: 1, mail: 1, com: 1, net: 1, org: 1, io: 1, dev: 1, co: 1 }
     var out = []
-    if (parts.length >= 2) out.push(parts[parts.length - 2]) // SLD, always
+    if (parts.length >= 2) out.push(parts[parts.length - 2])
     for (var i = 0; i < parts.length; i++) {
       if (parts[i].length > 2 && !skip[parts[i]] && out.indexOf(parts[i]) === -1) out.push(parts[i])
     }
     return out
   }
 
-  // Precise entry <-> app_id match: exact desktop-entry id, then the
-  // entry's StartupWMClass, then webapp-token equality. Deliberately NO
-  // generic substring matching — "code" must not claim "code-oss", and
-  // short ids must not light the wrong pin's dot (review finding).
   function entryMatchesAppId(entry, appId) {
     if (!entry) return false
     var key = String(appId || "").toLowerCase()
     if (String(entry.id || "").toLowerCase() === key) return true
-    var sc = ""
-    try { sc = String(entry.startupClass || "") } catch (e) {}
-    if (sc.length > 0 && sc.toLowerCase() === key) return true
+    try { if (String(entry.startupClass || "").toLowerCase() === key) return true } catch (e) {}
     var toks = root.webappTokens(key)
     if (toks.length > 0) {
       var eid = String(entry.id || "").toLowerCase()
@@ -268,7 +263,6 @@ Item {
     return false
   }
 
-  // The app_id key a pin's running windows live under, or "" if none.
   function runningKeyFor(pin) {
     var needle = String(pin.id || "").toLowerCase()
     var entry = pin.entry || root.entryIndex[pin.id] || null
@@ -284,10 +278,11 @@ Item {
     return key.length > 0 ? root.runningAppIds[key] : null
   }
 
-  // Click on a running app: focus its window. Clicked again while one of
-  // its windows is already focused: cycle to its next window — that plus
-  // activate() switching workspaces is what makes the dock a mouse-only
-  // way to move between open programs, macOS style.
+  function windowsFor(d) {
+    if (d === null || d === undefined) return []
+    return (d.isExtra === true) ? (root.runningAppIds[d.key] || []) : (root.toplevelsFor(d) || [])
+  }
+
   function focusNext(toplevels) {
     if (!toplevels || toplevels.length === 0) return
     var active = -1
@@ -298,35 +293,42 @@ Item {
     if (next && typeof next.activate === "function") next.activate()
   }
 
-  function launchOrFocus(pin, toplevels) {
-    if (toplevels && toplevels.length > 0) {
-      root.focusNext(toplevels)
-    } else if (!pin.isExtra && root.appLibrary) {
-      root.appLibrary.launch(pin.id, pin.name)
+  function launchApp(desktopId, name) {
+    if (root.appLibrary && typeof root.appLibrary.launch === "function") {
+      root.appLibrary.launch(desktopId, name)
+    } else {
+      var id = String(desktopId || "").trim()
+      if (id.length > 0) {
+        if (id.slice(-8) === ".desktop") id = id.slice(0, -8)
+        Quickshell.execDetached(["uwsm-app", "--", "gtk-launch", id + ".desktop"])
+      }
     }
   }
 
-  // Desktop entry for a bare Wayland app_id: Quickshell's own
-  // heuristicLookup first (exact id + StartupWMClass, the API this code
-  // used to reimplement worse), then the same precise matcher used for
-  // pins (covers webapp app_ids, whose entries carry no StartupWMClass).
+  // Left-click on a running app: cycle windows when one is active, otherwise
+  // bring the app forward (also un-minimizes windows parked on the scratchpad).
+  function launchOrFocus(pin, toplevels) {
+    if (toplevels && toplevels.length > 0) {
+      var anyActive = false
+      for (var i = 0; i < toplevels.length; i++) {
+        if (toplevels[i] && toplevels[i].activated === true) { anyActive = true; break }
+      }
+      if (anyActive) root.focusNext(toplevels)
+      else root.restoreApp(toplevels)
+    } else if (!pin.isExtra) {
+      root.launchApp(pin.id, pin.name)
+    }
+  }
+
   function entryForAppId(appId) {
-    try {
-      var e = DesktopEntries.heuristicLookup(String(appId))
-      if (e) return e
-    } catch (err) {}
-    var idx = root.entryIndex
-    var keys = Object.keys(idx)
+    try { var e = DesktopEntries.heuristicLookup(String(appId)); if (e) return e } catch (err) {}
+    var keys = Object.keys(root.entryIndex)
     for (var i = 0; i < keys.length; i++) {
-      if (root.entryMatchesAppId(idx[keys[i]], appId)) return idx[keys[i]]
+      if (root.entryMatchesAppId(root.entryIndex[keys[i]], appId)) return root.entryIndex[keys[i]]
     }
     return null
   }
 
-  // Running apps that resolve to no pinned slot. They render to the right
-  // of a divider, macOS style, so every open program is clickable from the
-  // dock even when it was launched elsewhere. Sorted by app_id so the row
-  // doesn't reshuffle every time focus moves.
   readonly property var runningExtras: {
     var claimed = {}
     for (var i = 0; i < root.resolvedPins.length; i++) {
@@ -341,10 +343,7 @@ Item {
       var appId = tls[0] ? String(tls[0].appId || keys[i]) : keys[i]
       var entry = root.entryForAppId(appId)
       out.push({
-        isExtra: true,
-        key: keys[i],
-        id: appId,
-        entry: entry,
+        isExtra: true, key: keys[i], id: appId, entry: entry,
         name: entry ? String(entry.name || appId) : ((tls[0] && tls[0].title) ? String(tls[0].title) : appId),
         icon: (entry && entry.icon) ? entry.icon : appId
       })
@@ -352,8 +351,6 @@ Item {
     return out
   }
 
-  // Pinned apps, then a separator, then running unpinned apps — the whole
-  // row the dock renders.
   readonly property var dockModel: {
     var out = root.resolvedPins.slice()
     if (root.runningExtras.length > 0) {
@@ -363,75 +360,200 @@ Item {
     return out
   }
 
-  Component.onCompleted: {
-    root.rebuildEntryIndex()
-    root.rebuildRunning()
-    if (root.appLibrary) root.appLibrary.refreshIcons()
+  // ------------------------------------------------------------ window actions via helper
+
+  // Hyprland 0.56 evaluates every `dispatch` through Lua, so window-targeted
+  // actions go through dock_helper.py (verified dispatcher calls live there).
+  readonly property string helperPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/dino.dock/dock_helper.py"
+
+  function runWindowAction(action, toplevels) {
+    // NOTE: foreign toplevels expose NO pid — match via appId (hyprctl class)
+    var pids = []
+    var cls = ""
+    if (toplevels) {
+      for (var i = 0; i < toplevels.length; i++) {
+        var t = toplevels[i]
+        if (!t) continue
+        var pid = t.pid || 0
+        if (pid > 0 && pids.indexOf(pid) === -1) pids.push(pid)
+        if (cls.length === 0 && t.appId) cls = String(t.appId)
+      }
+    }
+    Quickshell.execDetached(["/usr/bin/python3", root.helperPath, action, pids.join(","), cls])
   }
 
-  // ------------------------------------------------------------ target monitor
+  function minimizeApp(d) {
+    root.runWindowAction("minimize", root.windowsFor(d))
+  }
 
-  // Optional: pin the dock to one specific monitor instead of whichever
-  // screen Quickshell enumerates first. Useful on multi-monitor rigs where
-  // a docking station renumbers connector names (DP-5 vs DP-6) across
-  // reboots — matching by manufacturer/model substring survives that,
-  // matching by connector name alone doesn't.
-  //
-  // Config in monitor.json next to this file, a single JSON string with
-  // any substring of the target's manufacturer/model/connector name,
-  // case-insensitive (e.g. "Odyssey G50F", or just "DP-2"). Absent or
-  // empty file = no preference, use the first enumerated screen.
-  // Same out-of-plugin-dir rule as pins and settings: editing a file
-  // inside the plugin checkout remounts the whole plugin (and dirties the
-  // git tree `omarchy plugin update` pulls into). The in-plugin
-  // monitor.json is still read as a legacy fallback.
-  readonly property string monitorPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/dino.dock.monitor.json"
-  readonly property string legacyMonitorPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/dino.dock/monitor.json"
-  property string monitorMatch: ""
-  property string monitorRaw: ""
-  property bool monitorFileExists: false
-  property string legacyMonitorRaw: ""
+  function maximizeApp(d) {
+    root.runWindowAction("togglemax", root.windowsFor(d))
+  }
 
-  function loadMonitorMatch(rawText) {
-    var text = String(rawText || "").trim()
-    if (text.length === 0) { root.monitorMatch = ""; return }
-    try {
-      var parsed = JSON.parse(text)
-      root.monitorMatch = String(parsed || "").trim().toLowerCase()
-    } catch (e) {
-      // Forgive a plain unquoted string too — less to get wrong by hand.
-      root.monitorMatch = text.toLowerCase()
+  function restoreApp(toplevels) {
+    root.runWindowAction("restore", toplevels)
+  }
+
+  function closeApp(toplevels) {
+    if (!toplevels) return
+    for (var i = 0; i < toplevels.length; i++) {
+      if (toplevels[i] && typeof toplevels[i].close === "function") toplevels[i].close()
     }
   }
 
-  function applyMonitor() {
-    root.loadMonitorMatch(root.monitorFileExists ? root.monitorRaw : root.legacyMonitorRaw)
+  function forceCloseApp(toplevels) {
+    if (!toplevels) return
+    for (var i = 0; i < toplevels.length; i++) {
+      if (toplevels[i] && toplevels[i].pid > 0) {
+        Quickshell.execDetached(["kill", "-9", String(toplevels[i].pid)])
+      }
+    }
   }
+
+  // ------------------------------------------------------------ window preview snapshots
+
+  // Hover previews grab the hovered app's visible window with a region
+  // screenshot (grim) and refresh on a short timer — cheap, no GPU loop.
+  readonly property string previewPath: "/tmp/dock-preview-" + (Quickshell.env("USER") || "u") + ".png"
+  property var previewTarget: null   // { x, y, w, h } | null
+  property int previewSeq: 0
+  property var previewToplevels: null
+
+  Process {
+    id: geometryProbe
+    command: ["/usr/bin/python3", root.helperPath, "geometry"]
+    stdout: StdioCollector {
+      onStreamFinished: root.pickPreviewTarget(this.text)
+    }
+  }
+
+  function pickPreviewTarget(raw) {
+    try {
+      var d = JSON.parse(raw)
+      var activeWs = (d.activeWorkspace !== undefined) ? d.activeWorkspace : -2
+      // foreign toplevels expose no pid — match hyprctl clients by class/appId
+      var idset = {}
+      var tls = root.previewToplevels || []
+      for (var i = 0; i < tls.length; i++) {
+        var t = tls[i]
+        var a = (t && t.appId) ? String(t.appId).toLowerCase() : ""
+        if (a.length > 0) idset[a] = true
+      }
+      var best = null
+      var bestArea = 0
+      for (i = 0; i < d.clients.length; i++) {
+        var c = d.clients[i]
+        if (!c.mapped || c.hidden) continue
+        if (c.workspace !== activeWs) continue
+        var ckey = String(c.class || "").toLowerCase()
+        if (!(idset[ckey])) continue
+        var w = (c.size && c.size[0]) || 0
+        var h = (c.size && c.size[1]) || 0
+        if (w < 60 || h < 60) continue
+        var area = w * h
+        if (area > bestArea) { bestArea = area; best = { x: c.at[0], y: c.at[1], w: w, h: h } }
+      }
+      root.previewTarget = best
+      if (best !== null) root.grabPreview()
+    } catch (e) { root.previewTarget = null }
+  }
+
+  Process {
+    id: shotProbe
+    command: []
+    stdout: StdioCollector {}
+    onExited: root.previewSeq++
+  }
+
+  function grabPreview() {
+    var t = root.previewTarget
+    if (t === null || t.w <= 0 || t.h <= 0) return
+    if (shotProbe.running) return
+    // grim: -g (global region) only — -o conflicts with -g
+    var geo = Math.max(0, t.x) + "," + Math.max(0, t.y) + " " + t.w + "x" + t.h
+    shotProbe.command = ["grim", "-g", geo, root.previewPath]
+    shotProbe.running = true
+  }
+
+  Timer {
+    id: previewRefreshTimer
+    interval: 2500
+    repeat: true
+    running: root.previewTarget !== null && dockCard.hoverRunning
+    onTriggered: {
+      geometryProbe.running = true
+      root.grabPreview()
+    }
+  }
+
+  function refreshPreview() {
+    root.previewToplevels = root.windowsFor(dockCard.hoverSlotData)
+    geometryProbe.running = true
+  }
+
+  Connections {
+    target: dockCard
+    function onHoverSlotDataChanged() {
+      if (dockCard.hoverSlotData !== null && dockCard.hoverRunning) root.refreshPreview()
+    }
+  }
+
+  // ------------------------------------------------------------ launcher (Launchpad-style app grid)
+
+  property bool launcherOpen: false
+  property string launcherQuery: ""
+
+  readonly property var launcherApps: {
+    var out = []
+    try {
+      var vals = DesktopEntries.applications.values
+      for (var i = 0; i < vals.length; i++) {
+        var e = vals[i]
+        if (!e || e.noDisplay === true) continue
+        var nm = String(e.name || "").trim()
+        if (nm.length === 0) continue
+        out.push({ id: String(e.id), name: nm, icon: String(e.icon || e.id), comment: String(e.comment || "") })
+      }
+    } catch (err) {}
+    out.sort(function(a, b) { return a.name.toLowerCase() < b.name.toLowerCase() ? -1 : 1 })
+    return out
+  }
+
+  readonly property var launcherFiltered: {
+    var q = root.launcherQuery.toLowerCase().trim()
+    if (q.length === 0) return root.launcherApps
+    return root.launcherApps.filter(function(e) {
+      return e.name.toLowerCase().indexOf(q) !== -1
+        || e.id.toLowerCase().indexOf(q) !== -1
+        || e.comment.toLowerCase().indexOf(q) !== -1
+    })
+  }
+
+  function launchFromLauncher(entry) {
+    if (!entry) return
+    root.launcherOpen = false
+    root.launcherQuery = ""
+    root.launchApp(entry.id, entry.name)
+  }
+
+  // ------------------------------------------------------------ monitor
+
+  readonly property string monitorPath: (Quickshell.env("HOME") || "") + "/.config/omarchy/dino.dock.monitor.json"
+  property string monitorMatch: ""
 
   FileView {
     id: monitorFile
     path: root.monitorPath
     watchChanges: true
     printErrors: false
-    onLoaded: { root.monitorRaw = text(); root.monitorFileExists = true; root.applyMonitor() }
+    onLoaded: { try { root.monitorMatch = String(JSON.parse(text()) || "").trim().toLowerCase() } catch (e) { root.monitorMatch = text().toLowerCase() } }
     onFileChanged: reload()
-    onLoadFailed: { root.monitorRaw = ""; root.monitorFileExists = false; root.applyMonitor() }
-  }
-
-  FileView {
-    id: legacyMonitorFile
-    path: root.legacyMonitorPath
-    watchChanges: true
-    printErrors: false
-    onLoaded: { root.legacyMonitorRaw = text(); root.applyMonitor() }
-    onFileChanged: reload()
-    onLoadFailed: { root.legacyMonitorRaw = ""; root.applyMonitor() }
+    onLoadFailed: { root.monitorMatch = "" }
   }
 
   function screenMatches(screen) {
     if (!screen || root.monitorMatch.length === 0) return false
-    var haystack = (String(screen.manufacturer || "") + " " + String(screen.model || "") + " " + String(screen.name || "")).toLowerCase()
-    return haystack.indexOf(root.monitorMatch) !== -1
+    return (String(screen.manufacturer || "") + " " + String(screen.model || "") + " " + String(screen.name || "")).toLowerCase().indexOf(root.monitorMatch) !== -1
   }
 
   readonly property var targetScreen: {
@@ -439,212 +561,279 @@ Item {
     for (var i = 0; i < screens.length; i++) {
       if (root.screenMatches(screens[i])) return screens[i]
     }
-    // No match configured, or the configured monitor isn't plugged in
-    // right now — fall back to something rather than rendering nowhere.
     return screens.length > 0 ? screens[0] : null
   }
 
-  // ------------------------------------------------------------ the dock UI
+  // ------------------------------------------------------------ constants
+  readonly property int iconSize: Style.space(36)
+  readonly property int iconGap: Style.space(6)
+  readonly property int padX: Style.space(10)
+  readonly property int padY: Style.space(6)
+  readonly property int appsBtnWidth: Style.space(40)
+  readonly property int cardHeight: iconSize + padY * 2   // card thickness (perpendicular)
+  readonly property int panelHeight: cardHeight + Style.space(16)
+
+  // perpendicular distance from the card's inner edge to popup content
+  readonly property int cardTopGap: Style.space(8) + root.cardHeight + Style.space(6)
+  readonly property int popupExtent: root.cardTopGap + Style.space(470)
+  readonly property int menuMaxWindows: 6
+
+  // ------------------------------------------------------------ popup state
+
+  readonly property bool popupActive: {
+    if (dockCard.menuData !== null) return true
+    if (dockCard.hoverSlotData === null) return false
+    if (dockCard.dragIndex >= 0) return false
+    return true
+  }
+
+  onPopupActiveChanged: {
+    if (popupActive) popupMaxTimer.restart()
+    else popupMaxTimer.stop()
+  }
+
+  // ------------------------------------------------------------ popup dismissal watchdog
+  // MouseArea hover-exit does NOT fire when the pointer leaves through an
+  // input-mask boundary, so popup keep-alive can't rely on it. Watch the real
+  // cursor: while a popup is open, dismiss it once the cursor leaves the dock
+  // card and every visible popup region. (popupMaxTimer stays as the hard cap.)
+  Timer {
+    id: popupWatch
+    interval: 250
+    repeat: true
+    running: root.popupActive
+    onTriggered: cursorProbe.running = true
+  }
+
+  Process {
+    id: cursorProbe
+    command: ["hyprctl", "cursorpos"]
+    stdout: StdioCollector { onStreamFinished: root.cursorCheck(this.text) }
+  }
+
+  function popupOrigin() {
+    var s = root.targetScreen
+    var sw = s ? s.width : 1920
+    var sh = s ? s.height : 1080
+    if (root.position === "bottom") return { x: 0, y: sh - popupPanel.implicitHeight }
+    if (root.position === "top") return { x: 0, y: 0 }
+    if (root.position === "left") return { x: 0, y: 0 }
+    return { x: sw - popupPanel.implicitWidth, y: 0 }
+  }
+
+  function dockCardScreenRect() {
+    var s = root.targetScreen
+    var sw = s ? s.width : 1920
+    var sh = s ? s.height : 1080
+    var g = Style.space(8)
+    if (root.isHorizontal) {
+      var cy = root.position === "bottom" ? sh - g - root.cardHeight : root.topInset + g
+      return { x: dockCard.x, y: cy, w: dockCard.width, h: root.cardHeight }
+    }
+    var cx = root.position === "left" ? g : sw - g - root.cardHeight
+    return { x: cx, y: dockCard.y, w: root.cardHeight, h: dockCard.height }
+  }
+
+  function insideRect(r, x, y, pad) {
+    return r && x >= r.x - pad && x <= r.x + r.w + pad && y >= r.y - pad && y <= r.y + r.h + pad
+  }
+
+  function cursorCheck(text) {
+    var parts = String(text).trim().split(",")
+    if (parts.length !== 2) return
+    var cx = parseFloat(parts[0])
+    var cy = parseFloat(parts[1])
+    if (!isFinite(cx) || !isFinite(cy)) return
+    var keep = insideRect(dockCardScreenRect(), cx, cy, 4)
+    if (!keep && root.popupActive) {
+      var o = popupOrigin()
+      var px = cx - o.x
+      var py = cy - o.y
+      keep = insideRect(popupPanel.cardRect(), px, py, 4)
+        || insideRect({ x: previewCard.x, y: previewCard.y, w: previewCard.width, h: previewCard.visible ? previewCard.height : 0 }, px, py, 2)
+        || insideRect({ x: pillItem.x, y: pillItem.y, w: pillItem.width, h: pillItem.visible ? pillItem.height : 0 }, px, py, 2)
+        || insideRect({ x: ctxMenu.x, y: ctxMenu.y, w: ctxMenu.width, h: ctxMenu.visible ? ctxMenu.height : 0 }, px, py, 2)
+        || insideRect({ x: tooltip.x, y: tooltip.y, w: tooltip.width, h: tooltip.visible ? tooltip.height : 0 }, px, py, 2)
+    }
+    if (!keep && root.popupActive) {
+      dockCard.hoverSlotData = null
+      dockCard.menuData = null
+      dockCard.pillHover = false
+      dockCard.slotHoverCount = 0
+    }
+  }
+
+  // ------------------------------------------------------------ dock panel
 
   PanelWindow {
     id: panel
-    visible: true
+    visible: !root.autohide || root.revealed
     screen: root.targetScreen
-    anchors { top: true; bottom: true; left: true; right: true }
+    anchors.bottom: root.position === "bottom" || root.isSide
+    anchors.top: root.position === "top" || root.isSide
+    anchors.left: root.position === "left" || root.isHorizontal
+    anchors.right: root.position === "right" || root.isHorizontal
+    implicitWidth: root.isHorizontal ? 0 : root.panelHeight
+    implicitHeight: root.isHorizontal ? root.panelHeight : 0
     color: "transparent"
     WlrLayershell.namespace: "omarchy-dock"
-    WlrLayershell.layer: WlrLayer.Top
+    // Top placement rides the Top layer so the compositor keeps Omarchy's bar
+    // at the very edge and stacks the dock right below it (verified ordering).
+    WlrLayershell.layer: root.position === "top" ? WlrLayer.Top : WlrLayer.Bottom
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
-    exclusionMode: ExclusionMode.Ignore
-    // Only the dock card (plus the context menu when open) accepts input;
-    // the rest of this full-screen surface stays click-through so it never
-    // blocks the desktop underneath, exactly like the notifications/OSD
-    // overlays. A long window-list menu can extend above dockCard's
-    // bounds, so the mask is a computed rect that grows upward with it —
-    // one flat region, no nested-Region semantics to trip over.
-    readonly property int maskTopOverflow: contextMenu.visible ? Math.max(0, -contextMenu.y) : 0
-    // Extends from the (possibly menu-raised) top of the dock down to the
-    // physical screen edge, so a pointer parked at the very bottom still
-    // counts as "at the dock" and autohide doesn't oscillate. Collapses to
-    // nothing while hidden — a hidden dock must not eat clicks.
+    exclusionMode: (root.autohide && !root.revealed) ? ExclusionMode.Ignore : ExclusionMode.Auto
+
+    // Input is only the dock card itself — popups live in the popup window.
     mask: Region {
-      x: dockCard.x
-      y: root.dockHidden ? 0 : dockCard.y - panel.maskTopOverflow
-      width: root.dockHidden ? 0 : dockCard.width
-      height: root.dockHidden ? 0 : panel.height - dockCard.y + panel.maskTopOverflow
-    }
-
-    // What keeps the dock on screen: pointer anywhere over/under the card
-    // (nearMa spans to the screen edge), the menu, or an in-flight drag —
-    // or autohide being off. Losing all of them starts the hide timer.
-    readonly property bool dockWanted: !root.autohide
-      || nearMa.containsMouse || menuHover.containsMouse || edgeMa.containsMouse
-      || dockCard.menuData !== null || dockCard.dragIndex >= 0
-    onDockWantedChanged: if (dockWanted) root.dockHidden = false
-
-    Timer {
-      interval: 700
-      running: root.autohide && !panel.dockWanted && !root.dockHidden
-      onTriggered: root.dockHidden = true
-    }
-
-    MouseArea {
-      id: nearMa
       x: dockCard.x
       y: dockCard.y
       width: dockCard.width
-      height: Math.max(0, panel.height - dockCard.y)
-      hoverEnabled: true
-      acceptedButtons: Qt.NoButton
+      height: dockCard.height
     }
-
-    readonly property real screenWidth: panel.screen ? panel.screen.width : 1920
 
     Item {
       id: dockCard
-      anchors.horizontalCenter: parent.horizontalCenter
-      anchors.bottom: parent.bottom
-      readonly property int restMargin: Math.max(Style.space(10), Style.gapsOut)
-      anchors.bottomMargin: root.dockHidden
-        ? -(cardHeight + restMargin + Style.space(6))
-        : restMargin
-      Behavior on anchors.bottomMargin {
-        NumberAnimation { duration: 200; easing.type: Easing.OutCubic }
-      }
-      width: cardWidth
-      height: cardHeight + headroom
+      anchors.horizontalCenter: root.isHorizontal ? parent.horizontalCenter : undefined
+      anchors.verticalCenter: root.isSide ? parent.verticalCenter : undefined
+      anchors.left: root.position === "left" ? parent.left : undefined
+      anchors.right: root.position === "right" ? parent.right : undefined
+      anchors.top: root.position === "top" ? parent.top : undefined
+      anchors.bottom: root.position === "bottom" ? parent.bottom : undefined
+      anchors.margins: Style.space(8)
+      width: root.isHorizontal ? rowLength : root.cardHeight
+      height: root.isHorizontal ? root.cardHeight : rowLength
 
-      readonly property int maxIconSize: Style.space(50)
-      readonly property int minIconSize: Style.space(32)
-      readonly property int iconGap: Style.space(10)
-      // Wide enough that the endmost icons clear the capsule's curved ends.
-      readonly property int padX: Style.space(24)
-      readonly property int padY: Style.space(8)
       readonly property bool hasSeparator: root.runningExtras.length > 0
-      readonly property int sepWidth: Style.space(2)
-      // Icon slots (pins + running extras); the separator is its own thin
-      // slot that takes sepWidth instead of iconSize.
+      readonly property int sepWidth: 1
       readonly property int iconCount: Math.max(1, root.dockModel.length - (hasSeparator ? 1 : 0))
       readonly property int slotCount: iconCount + (hasSeparator ? 1 : 0)
-      readonly property real availableWidth: panel.screenWidth * 0.86
+      readonly property int fixedPad: root.padX * 2 + (slotCount - 1) * root.iconGap + (hasSeparator ? sepWidth : 0) + root.appsBtnWidth
+      readonly property int rowLength: (iconCount * root.iconSize) + fixedPad
 
-      // Grow wider up to ~86% of screen width; past that, shrink icons to
-      // fit — the same trade-off the real macOS dock makes.
-      readonly property int fixedWidth: (slotCount - 1) * iconGap + (hasSeparator ? sepWidth : 0) + padX * 2
-      readonly property int naturalWidth: iconCount * maxIconSize + fixedWidth
-      readonly property int iconSize: naturalWidth <= availableWidth
-        ? maxIconSize
-        : Math.max(minIconSize, Math.floor((availableWidth - fixedWidth) / iconCount))
-
-      readonly property int cardWidth: root.dockModel.length > 0
-        ? (iconSize * iconCount + fixedWidth)
-        : (maxIconSize + padX * 2)
-      readonly property int cardHeight: iconSize + padY * 2
-      // Extra vertical room above the pill so magnified/bouncing icons have
-      // somewhere to rise into — and so the click-mask (sized to this whole
-      // item) still covers them while they're up there.
-      readonly property int headroom: Math.round(iconSize * (magStrength + 0.35))
-
-      // ---- right-click pin menu ----
-      property var menuData: null // modelData of the icon the menu is open for
+      property var menuData: null
       property real menuX: 0
+      property int dragIndex: -1
+      property int dragTargetIndex: -1
 
-      // ---- drag-to-reorder (pins only) ----
-      property int dragIndex: -1       // dockModel index of the pin being dragged
-      property int dragTargetIndex: -1 // insertion point among pins [0..pinCount]
+      // hover state shared with the popup window (pill / tooltip)
+      property var hoverSlotData: null
+      property bool hoverRunning: false
+      property bool hoverIsExtra: false
+      property real hoverX: 0
+      property bool pillHover: false
+      property int slotHoverCount: 0
 
-      function insertionIndexAt(xInCard) {
-        var rel = xInCard - iconRow.x
-        var idx = Math.round(rel / (iconSize + iconGap))
-        return Math.max(0, Math.min(root.resolvedPins.length, idx))
+      function noteHover(data, running, isExtra, axisCenter) {
+        // set flags FIRST — hoverSlotData last (its change drives the preview refresh)
+        hoverRunning = running === true
+        hoverIsExtra = isExtra === true
+        hoverX = axisCenter
+        hoverSlotData = data
+        hoverHideTimer.restart()
       }
 
-      function finishDrag() {
-        var from = dragIndex
-        var to = dragTargetIndex
-        dragIndex = -1
-        dragTargetIndex = -1
-        if (from < 0 || to < 0 || from >= root.pinnedIds.length) return
-        var insertAt = to > from ? to - 1 : to
-        if (insertAt === from) return
-        var ids = root.pinnedIds.slice()
-        var moved = ids.splice(from, 1)[0]
-        ids.splice(insertAt, 0, moved)
-        root.writePinned(ids)
+      function hoverLeft(data) {
+        if (hoverSlotData === data) hoverHideTimer.restart()
       }
 
-      // ---- hover magnification ----
-      property real hoverX: -100000
-      readonly property real magRadius: iconSize * 2.1
-      readonly property real magStrength: 0.85
-
-      function scaleFor(centerX) {
-        if (dockCard.hoverX < -99999) return 1.0
-        var d = Math.abs(centerX - dockCard.hoverX)
-        if (d >= dockCard.magRadius) return 1.0
-        var t = 1 - d / dockCard.magRadius
-        return 1.0 + dockCard.magStrength * t * t
-      }
-
-      BorderSurface {
-        id: cardBg
-        width: dockCard.cardWidth
-        height: dockCard.cardHeight
-        anchors.horizontalCenter: parent.horizontalCenter
-        anchors.bottom: parent.bottom
-        // Full capsule + near-opaque fill + 1px low-alpha hairline. The old
-        // theme-driven look (small radius, 2px accent border, 0.92 alpha)
-        // read as a boxy web panel: window edges behind bled through the
-        // translucency as seams, and the bright border boxed it in. macOS
-        // docks are a soft capsule with a border you barely register.
-        radius: Math.round(height / 2)
-        borderSpec: Border.flat(Util.alpha(Color.popups.border, 0.35), 1)
-        // Vertical glass sheen: catches light at the top, settles darker at
-        // the base. Derived from the theme background so it follows theme
-        // switches instead of hardcoding a palette. On light themes the
-        // lighten/sheen amounts are dialed way down — lightening an
-        // already-light background just washes the capsule to white
-        // (review finding).
-        readonly property bool lightTheme: Color.popups.background.hslLightness > 0.5
-        gradient: Gradient {
-          GradientStop { position: 0.0; color: Util.alpha(Qt.lighter(Color.popups.background, cardBg.lightTheme ? 1.06 : 2.1), 0.97) }
-          GradientStop { position: 0.45; color: Util.alpha(Color.popups.background, 0.97) }
-          GradientStop { position: 1.0; color: Util.alpha(Qt.darker(Color.popups.background, cardBg.lightTheme ? 1.10 : 1.5), 0.98) }
+      Timer {
+        id: hoverHideTimer
+        interval: 300
+        onTriggered: {
+          if (!dockCard.pillHover && dockCard.slotHoverCount <= 0) dockCard.hoverSlotData = null
         }
+      }
 
-        // Additive white sheen over the top half — the base color is dark
-        // enough that lightening it multiplicatively (above) barely reads,
-        // so the actual "glass" cue comes from this overlay, same as the
-        // aqua-era gloss trick.
+      Connections {
+        target: root
+        function onDockModelChanged() {
+          // delegates were rebuilt — stale hover state must not linger
+          dockCard.hoverSlotData = null
+          dockCard.pillHover = false
+          dockCard.slotHoverCount = 0
+        }
+      }
+
+      // ---- background ----
+      Rectangle {
+        width: dockCard.width
+        height: dockCard.height
+        radius: Style.space(12)
+        color: "#13141c"
+        border.width: 1
+        border.color: Util.alpha(Color.accent, 0.15)
+      }
+
+      Flow {
+        id: mainRow
+        flow: root.isHorizontal ? Flow.LeftToRight : Flow.TopToBottom
+        spacing: root.iconGap
+        anchors.horizontalCenter: root.isHorizontal ? parent.horizontalCenter : undefined
+        anchors.verticalCenter: root.isSide ? parent.verticalCenter : undefined
+        anchors.left: root.position === "left" ? parent.left : undefined
+        anchors.right: root.position === "right" ? parent.right : undefined
+        anchors.top: root.position === "top" ? parent.top : undefined
+        anchors.bottom: root.position === "bottom" ? parent.bottom : undefined
+        anchors.margins: root.padX
+
+        // ---- Apps button (vector glyph, opens the Launchpad-style grid) ----
         Rectangle {
-          anchors.fill: parent
-          radius: parent.radius
-          gradient: Gradient {
-            GradientStop { position: 0.0; color: Qt.rgba(1, 1, 1, cardBg.lightTheme ? 0.05 : 0.16) }
-            GradientStop { position: 0.5; color: Qt.rgba(1, 1, 1, cardBg.lightTheme ? 0.01 : 0.02) }
-            GradientStop { position: 1.0; color: Qt.rgba(1, 1, 1, 0.0) }
+          id: appsBtn
+          width: root.appsBtnWidth
+          height: root.iconSize
+          radius: Style.space(8)
+          color: appsBtnMa.containsMouse ? Util.alpha(Color.accent, 0.2) : "transparent"
+
+          Item {
+            id: launcherGlyph
+            anchors.centerIn: parent
+            width: Style.space(18)
+            height: Style.space(18)
+
+            readonly property real cell: (width - Style.space(4)) / 2
+            readonly property real bright: appsBtnMa.containsMouse ? 1.0 : 0.0
+
+            // 2x2 rounded-square grid — top-right tile lit, Launchpad style
+            Rectangle {
+              x: 0; y: 0
+              width: launcherGlyph.cell; height: launcherGlyph.cell
+              radius: Style.space(3)
+              color: Color.accent
+              opacity: 0.45 + 0.55 * launcherGlyph.bright
+            }
+            Rectangle {
+              x: launcherGlyph.cell + Style.space(4); y: 0
+              width: launcherGlyph.cell; height: launcherGlyph.cell
+              radius: Style.space(3)
+              color: Color.accent
+              opacity: 1.0
+            }
+            Rectangle {
+              x: 0; y: launcherGlyph.cell + Style.space(4)
+              width: launcherGlyph.cell; height: launcherGlyph.cell
+              radius: Style.space(3)
+              color: Color.accent
+              opacity: 0.45 + 0.35 * launcherGlyph.bright
+            }
+            Rectangle {
+              x: launcherGlyph.cell + Style.space(4); y: launcherGlyph.cell + Style.space(4)
+              width: launcherGlyph.cell; height: launcherGlyph.cell
+              radius: Style.space(3)
+              color: Color.accent
+              opacity: 0.45 + 0.35 * launcherGlyph.bright
+            }
+          }
+
+          MouseArea {
+            id: appsBtnMa
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.launcherOpen = !root.launcherOpen
           }
         }
-      }
 
-      MouseArea {
-        id: hoverArea
-        anchors.fill: parent
-        hoverEnabled: true
-        acceptedButtons: Qt.NoButton
-        onPositionChanged: dockCard.hoverX = mouseX
-        onExited: {
-          dockCard.hoverX = -100000
-          menuCloseTimer.restart()
-        }
-      }
-
-      Row {
-        id: iconRow
-        anchors.horizontalCenter: parent.horizontalCenter
-        anchors.bottom: parent.bottom
-        spacing: dockCard.iconGap
-
+        // ---- icon slots ----
         Repeater {
           model: root.dockModel
 
@@ -652,301 +841,671 @@ Item {
             id: slot
             required property var modelData
             required property int index
-            readonly property bool isSep: slot.modelData.isSeparator === true
-            width: slot.isSep ? dockCard.sepWidth : dockCard.iconSize
-            height: dockCard.height
+            readonly property bool isSep: modelData.isSeparator === true
+            readonly property bool isExtra: modelData.isExtra === true
+            readonly property bool isPinned: !isSep && !isExtra
+            width: isSep ? (root.isHorizontal ? dockCard.sepWidth : root.iconSize) : root.iconSize
+            height: isSep ? (root.isHorizontal ? root.iconSize : dockCard.sepWidth) : root.iconSize
 
-            readonly property real slotCenterX: iconRow.x + slot.x + width / 2
-            readonly property real targetScale: slot.isSep ? 1.0 : dockCard.scaleFor(slotCenterX)
-            property bool hovered: false
-            readonly property var runningToplevels: slot.isSep ? null
-              : (slot.modelData.isExtra === true
-                  ? (root.runningAppIds[slot.modelData.key] || null)
-                  : root.toplevelsFor(slot.modelData))
-            readonly property bool isRunning: slot.runningToplevels !== null && slot.runningToplevels.length > 0
+            readonly property var runningToplevels: isSep ? null
+              : (isExtra ? (root.runningAppIds[modelData.key] || null) : root.toplevelsFor(modelData))
+            readonly property bool isRunning: runningToplevels !== null && runningToplevels.length > 0
 
-            // The pins/running divider — a soft hairline like macOS's.
+            // separator
             Rectangle {
-              visible: slot.isSep
-              width: dockCard.sepWidth
-              height: dockCard.iconSize * 0.72
-              radius: width / 2
-              color: Util.alpha(Color.popups.border, 0.45)
-              anchors.horizontalCenter: parent.horizontalCenter
-              anchors.bottom: parent.bottom
-              anchors.bottomMargin: dockCard.padY + (dockCard.iconSize - height) / 2
+              visible: isSep
+              width: root.isHorizontal ? dockCard.sepWidth : root.iconSize * 0.6
+              height: root.isHorizontal ? root.iconSize * 0.6 : dockCard.sepWidth
+              color: Util.alpha(Color.accent, 0.35)
+              anchors.centerIn: parent
             }
 
-            Rectangle {
-              id: dot
-              visible: slot.isRunning
-              width: Style.space(5)
-              height: Style.space(5)
-              radius: width / 2
-              color: Color.accent
-              anchors.horizontalCenter: parent.horizontalCenter
-              anchors.bottom: parent.bottom
-              anchors.bottomMargin: Style.space(3)
-            }
-
+            // icon tile
             Rectangle {
               id: tile
-              visible: !slot.isSep
-              width: slot.isSep ? 0 : dockCard.iconSize
-              height: dockCard.iconSize
-              radius: Style.space(12)
-              color: slot.hovered ? Style.hoverFill : "transparent"
-              anchors.horizontalCenter: parent.horizontalCenter
-              // Anchored to the pill's own bottom (padY in from the edge),
-              // not to the running-indicator dot below it — dot is a
-              // separate overlay, and anchoring the icon to it always
-              // reserved dot-height + extra padding beneath the icon with
-              // nothing matching above it, pushing every icon off-center
-              // upward regardless of whether that pin was even running.
-              anchors.bottom: parent.bottom
-              anchors.bottomMargin: dockCard.padY + tile.bounceOffset
-              transformOrigin: Item.Bottom
-              scale: slot.targetScale
-              opacity: dockCard.dragIndex === slot.index ? 0.35 : 1.0
+              visible: !isSep
+              width: root.iconSize
+              height: root.iconSize
+              radius: Style.space(10)
+              color: slotMa.containsMouse ? Util.alpha(Color.accent, 0.15) : "transparent"
+              anchors.centerIn: parent
+              opacity: dockCard.dragIndex === index ? 0.4 : 1.0
 
-              property real bounceOffset: 0
-
-              Behavior on scale {
-                SpringAnimation { spring: 3.2; damping: 0.28 }
-              }
-
-              SequentialAnimation {
-                id: bounceAnim
-                NumberAnimation { target: tile; property: "bounceOffset"; to: dockCard.iconSize * 0.45; duration: 160; easing.type: Easing.OutQuad }
-                NumberAnimation { target: tile; property: "bounceOffset"; to: 0; duration: 260; easing.type: Easing.OutBounce }
-                NumberAnimation { target: tile; property: "bounceOffset"; to: dockCard.iconSize * 0.22; duration: 130; easing.type: Easing.OutQuad }
-                NumberAnimation { target: tile; property: "bounceOffset"; to: 0; duration: 220; easing.type: Easing.OutBounce }
-              }
-
-              // Icons come from a mix of icon themes: some ship as
-              // transparent art (Chromium, Neovim, Obsidian) that sits
-              // cleanly on the dock, others bake in an opaque square
-              // background (foot, btop, OBS, generic fallbacks) that reads
-              // as a mismatched tile next to the rest. Clipping every icon
-              // to one consistent rounded silhouette (same family as the
-              // tile's own radius) makes the row read as one shape
-              // language instead of a patchwork grid — a no-op for icons
-              // that are already transparent, a real fix for the ones that
-              // aren't.
               Image {
                 id: icon
                 anchors.fill: parent
                 anchors.margins: Style.space(4)
                 fillMode: Image.PreserveAspectFit
                 asynchronous: true
-                sourceSize.width: width * Screen.devicePixelRatio
-                sourceSize.height: height * Screen.devicePixelRatio
-                visible: false
-                layer.enabled: true
+                sourceSize.width: 128
+                sourceSize.height: 128
+                visible: true
+                smooth: true
+                mipmap: true
 
-                // Whatever icon theme resolves an app's default icon varies
-                // wildly in polish — some ship clean art (Chromium, Neovim),
-                // others fall back to a plain glyph on a flat square (foot,
-                // the old btop/localsend renders). Papirus is a curated,
-                // near-universal pack with consistently-styled art for
-                // almost everything here, so prefer it explicitly and only
-                // fall back to the normal themed lookup for the rare pin it
-                // doesn't cover (e.g. omacalc, an Omarchy-only app).
-                readonly property string papirusPath: "file:///usr/share/icons/Papirus/64x64/apps/" + (slot.modelData.icon || "") + ".svg"
-                // Resolve through Qt's icon theme engine (Quickshell.iconPath
-                // is synchronous — no appLibrary refresh race), with
-                // appLibrary as a further fallback for anything exotic.
                 readonly property string themedPath: {
                   var ic = String(slot.modelData.icon || "")
-                  if (ic.length === 0) return ""
+                  if (!ic) return ""
                   if (ic.charAt(0) === "/") return "file://" + ic
-                  try {
-                    var p = Quickshell.iconPath(ic, true)
-                    if (p && p.length > 0) return p.charAt(0) === "/" ? "file://" + p : p
-                  } catch (e) {}
+                  try { var p = Quickshell.iconPath(ic, true); if (p) return p.charAt(0) === "/" ? "file://" + p : p } catch (e) {}
                   return root.appLibrary ? root.appLibrary.iconSource(ic) : ""
                 }
-                // Last resort for running apps whose app_id resolves to no
-                // usable icon anywhere (e.g. bare agent/terminal wrappers):
-                // a generic app tile beats an invisible one.
-                readonly property string genericPath: "file:///usr/share/icons/Papirus/64x64/apps/application-default-icon.svg"
-
-                // Staged fallback that KEEPS source a binding: assigning
-                // source imperatively in onStatusChanged broke the binding,
-                // so a recycled delegate whose modelData changed kept the
-                // previous app's picture (review finding). stage resets
-                // whenever the candidate list (i.e. the icon) changes.
+                readonly property string genericPath: {
+                  try { var p = Quickshell.iconPath("application-x-executable", true); if (p) return p.charAt(0) === "/" ? "file://" + p : p } catch (e) {}
+                  return "file://" + (Quickshell.env("HOME") || "") + "/.local/share/icons/Papirus/64x64/apps/application-default-icon.svg"
+                }
                 readonly property var candidates: {
-                  var out = [icon.papirusPath]
-                  if (icon.themedPath.length > 0) out.push(icon.themedPath)
-                  out.push(icon.genericPath)
+                  var ic = String(slot.modelData.icon || "")
+                  var out = []
+                  if (themedPath) out.push(themedPath)
+                  if (ic.length > 0) {
+                    out.push("file://" + (Quickshell.env("HOME") || "") + "/.local/share/icons/Papirus/64x64/apps/" + ic + ".svg")
+                    out.push("file://" + (Quickshell.env("HOME") || "") + "/.local/share/icons/Papirus/64x64/apps/" + ic + ".png")
+                    out.push("file://" + (Quickshell.env("HOME") || "") + "/.local/share/icons/hicolor/512x512/apps/" + ic + ".png")
+                  }
+                  out.push(genericPath)
                   return out
                 }
                 property int stage: 0
                 onCandidatesChanged: stage = 0
                 source: candidates[Math.min(stage, candidates.length - 1)]
-                onStatusChanged: {
-                  if (status === Image.Error && stage < candidates.length - 1) stage += 1
-                }
-              }
-
-              Rectangle {
-                id: iconMask
-                anchors.fill: icon
-                radius: Style.space(9)
-                visible: false
-                layer.enabled: true
-              }
-
-              MultiEffect {
-                anchors.fill: icon
-                source: icon
-                maskEnabled: true
-                maskSource: iconMask
-                maskThresholdMin: 0.5
-                maskSpreadAtMin: 0.05
+                onStatusChanged: { if (status === Image.Error && stage < candidates.length - 1) stage += 1 }
               }
             }
 
-            // A child of the scaled tile, so the clickable area follows the
-            // magnified pixels instead of staying the unscaled square
-            // (review finding).
+            // running "shell": rounded ring around the icon (replaces the dot)
+            Rectangle {
+              visible: isRunning && !isSep
+              width: root.iconSize + Style.space(4)
+              height: root.iconSize + Style.space(4)
+              radius: Style.space(12)
+              color: "transparent"
+              border.color: Color.accent
+              border.width: Math.max(2, Style.space(2))
+              anchors.centerIn: parent
+              z: 5
+            }
+
+            // click + drag handler
             MouseArea {
               id: slotMa
-              parent: tile
               anchors.fill: parent
-              visible: !slot.isSep
-              enabled: !slot.isSep
+              visible: !isSep
+              enabled: !isSep
               hoverEnabled: true
               acceptedButtons: Qt.LeftButton | Qt.RightButton
               cursorShape: Qt.PointingHandCursor
-              onEntered: slot.hovered = true
-              onExited: slot.hovered = false
 
-              // Drag-to-reorder: pins only. A left-press that travels more
-              // than half an icon horizontally becomes a drag; release
-              // commits the new order through the same writePinned path the
-              // menu uses.
-              readonly property bool draggable: !slot.isSep && slot.modelData.isExtra !== true
-              property real pressX: 0
-              property bool didDrag: false
+              property bool isDragging: false
+              property real dragPressX: 0
+              property real dragPressY: 0
 
-              onPressed: mouse => {
+              onContainsMouseChanged: {
+                if (containsMouse) {
+                  dockCard.slotHoverCount++
+                  var axis = root.isHorizontal
+                    ? (mainRow.x + slot.x + slot.width / 2)
+                    : (mainRow.y + slot.y + slot.height / 2)
+                  dockCard.noteHover(slot.modelData, slot.isRunning, slot.isExtra, axis)
+                } else {
+                  dockCard.slotHoverCount = Math.max(0, dockCard.slotHoverCount - 1)
+                  dockCard.hoverLeft(slot.modelData)
+                }
+              }
+
+              onPressed: (mouse) => {
                 if (mouse.button === Qt.LeftButton) {
-                  pressX = mouse.x
-                  didDrag = false
+                  dragPressX = mouse.x
+                  dragPressY = mouse.y
+                  isDragging = false
                 }
               }
-              onPositionChanged: mouse => {
-                if (!pressed || !draggable) return
-                if (!didDrag && Math.abs(mouse.x - pressX) > dockCard.iconSize * 0.5) {
-                  didDrag = true
+
+              onPositionChanged: (mouse) => {
+                if (!pressed || isSep || isExtra) return
+                var axisDelta = root.isHorizontal
+                  ? Math.abs(mouse.x - dragPressX)
+                  : Math.abs(mouse.y - dragPressY)
+                if (!isDragging && axisDelta > root.iconSize * 0.5) {
+                  isDragging = true
+                  dockCard.dragIndex = index
                   dockCard.menuData = null
-                  dockCard.dragIndex = slot.index
                 }
-                if (didDrag) {
-                  // Map through the (possibly scaled) tile so drag targeting
-                  // stays accurate under magnification.
-                  dockCard.dragTargetIndex = dockCard.insertionIndexAt(
-                    slotMa.mapToItem(dockCard, mouse.x, 0).x)
-                }
-              }
-              onReleased: {
-                if (didDrag) {
-                  dockCard.finishDrag()
-                  // Cleared AFTER any synthesized click delivers, so a drag
-                  // released outside the slot doesn't leave didDrag armed to
-                  // swallow the next real click (review finding).
-                  Qt.callLater(function() { slotMa.didDrag = false })
+                if (isDragging) {
+                  var rel = root.isHorizontal
+                    ? mapToItem(dockCard, mouse.x, 0).x
+                    : mapToItem(dockCard, 0, mouse.y).y
+                  dockCard.dragTargetIndex = Math.max(0, Math.min(root.pinnedIds.length, Math.round(rel / (root.iconSize + root.iconGap))))
                 }
               }
-              onClicked: mouse => {
-                if (didDrag) {
-                  return
-                }
-                if (mouse.button === Qt.RightButton) {
-                  // Toggle the menu for this icon.
-                  if (dockCard.menuData === slot.modelData) {
-                    dockCard.menuData = null
-                  } else {
-                    dockCard.menuX = slot.slotCenterX
-                    dockCard.menuData = slot.modelData
+
+              onReleased: (mouse) => {
+                if (isDragging && dockCard.dragIndex >= 0 && dockCard.dragTargetIndex >= 0) {
+                  var from = dockCard.dragIndex
+                  var to = dockCard.dragTargetIndex
+                  if (from !== to && from < root.pinnedIds.length) {
+                    var ids = root.pinnedIds.slice()
+                    var moved = ids.splice(from, 1)[0]
+                    var insertAt = to > from ? to - 1 : to
+                    if (insertAt !== from) {
+                      ids.splice(insertAt, 0, moved)
+                      root.writePinned(ids)
+                    }
                   }
+                }
+                dockCard.dragIndex = -1
+                dockCard.dragTargetIndex = -1
+                isDragging = false
+              }
+
+              onClicked: (mouse) => {
+                if (isDragging) return
+                if (mouse.button === Qt.RightButton) {
+                  dockCard.menuX = root.isHorizontal
+                    ? (mainRow.x + x + width / 2)
+                    : (mainRow.y + y + height / 2)
+                  dockCard.menuData = (dockCard.menuData === modelData) ? null : modelData
                   return
                 }
                 dockCard.menuData = null
-                // Bounce is a "launching" cue — focusing an already-running
-                // window just switches to it, no theatrics (macOS again).
-                if (!slot.isRunning) bounceAnim.start()
-                root.launchOrFocus(slot.modelData, slot.runningToplevels)
-              }
-            }
-
-            Rectangle {
-              id: tooltip
-              visible: opacity > 0
-              // Suppressed while the pin menu is up — they occupy the same
-              // spot above the icon.
-              opacity: (slot.hovered && dockCard.menuData === null) ? 1 : 0
-              Behavior on opacity { NumberAnimation { duration: 120 } }
-              radius: Style.space(6)
-              color: Util.alpha(Color.tooltip.background, 0.95)
-              width: tooltipLabel.implicitWidth + Style.space(16)
-              height: tooltipLabel.implicitHeight + Style.space(8)
-              anchors.horizontalCenter: tile.horizontalCenter
-              anchors.bottom: tile.top
-              anchors.bottomMargin: Style.space(10) + dockCard.iconSize * (slot.targetScale - 1)
-
-              Text {
-                id: tooltipLabel
-                anchors.centerIn: parent
-                text: slot.modelData.name || ""
-                color: Color.tooltip.text
-                font.family: Style.fontFamily
-                font.pixelSize: Style.font.bodySmall
+                root.launcherOpen = false
+                root.launchOrFocus(modelData, runningToplevels)
               }
             }
           }
         }
       }
 
-      // ---- right-click menu ----
-      //
-      // Per-icon context menu: New Window, a jump list of the app's open
-      // windows (click one to focus it, wherever it lives), Quit (closes
-      // every window via the same foreign-toplevel protocol activate()
-      // uses), and Pin/Unpin. Can extend above dockCard's bounds, so the
-      // panel's input mask unions it in explicitly. Closes on action, on
-      // left-click of any icon, on right-click toggle, or shortly after
-      // the pointer leaves both the dock and the menu.
+      // ---- drag insertion indicator ----
       Rectangle {
-        id: contextMenu
+        visible: dockCard.dragTargetIndex >= 0
+        width: root.isHorizontal ? Style.space(3) : root.iconSize
+        height: root.isHorizontal ? root.iconSize : Style.space(3)
+        radius: width / 2
+        color: Color.accent
+        z: 50
+        x: root.isHorizontal
+          ? mainRow.x + root.appsBtnWidth + root.iconGap + dockCard.dragTargetIndex * (root.iconSize + root.iconGap) - root.iconGap / 2 - width / 2
+          : (root.position === "left" ? mainRow.x + mainRow.width + Style.space(2) : mainRow.x - Style.space(2) - width)
+        y: root.isHorizontal
+          ? (root.position === "bottom" ? mainRow.y + mainRow.height + Style.space(2) : mainRow.y - Style.space(2) - height)
+          : mainRow.y + root.appsBtnWidth + root.iconGap + dockCard.dragTargetIndex * (root.iconSize + root.iconGap) - root.iconGap / 2 - height / 2
+      }
+    }
+  }
+
+  // ------------------------------------------------------------ popup window
+  // Top-layer window hosting the hover preview card, tooltip and the
+  // right-click menu so they float above app windows.
+
+  PanelWindow {
+    id: popupPanel
+    visible: root.popupActive
+    screen: root.targetScreen
+    anchors.bottom: root.position === "bottom" || root.isSide
+    anchors.top: root.position === "top" || root.isSide
+    anchors.left: root.isHorizontal || root.position === "left"
+    anchors.right: root.isHorizontal || root.position === "right"
+    implicitWidth: root.isHorizontal ? 0 : root.popupExtent
+    implicitHeight: root.isHorizontal ? root.popupExtent + (root.position === "top" ? root.topInset : 0) : 0
+    color: "transparent"
+    WlrLayershell.namespace: "omarchy-dock-popup"
+    WlrLayershell.layer: WlrLayer.Top
+    WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+    exclusionMode: ExclusionMode.Ignore
+
+    readonly property int topInset: root.position === "top" ? root.topInset : 0
+
+    readonly property bool menuOpen: dockCard.menuData !== null
+    readonly property bool dragBusy: dockCard.dragIndex >= 0
+    readonly property bool previewVisible: !menuOpen && !dragBusy
+      && dockCard.hoverSlotData !== null && dockCard.hoverRunning
+    readonly property bool pillVisible: !menuOpen && !dragBusy
+      && dockCard.hoverSlotData !== null
+      && !dockCard.hoverRunning && !dockCard.hoverIsExtra
+    readonly property bool tooltipVisible: !menuOpen && !dragBusy
+      && dockCard.hoverSlotData !== null
+      && !dockCard.hoverRunning
+
+    // dock card rectangle mapped into this window's coordinates
+    function cardRect() {
+      if (root.isHorizontal) {
+        var cy = root.position === "bottom"
+          ? height - Style.space(8) - root.cardHeight
+          : topInset + Style.space(8)
+        return { x: dockCard.x, y: cy, w: dockCard.width, h: root.cardHeight }
+      }
+      var cx = root.position === "left"
+        ? Style.space(8)
+        : width - Style.space(8) - root.cardHeight
+      return { x: cx, y: dockCard.y, w: root.cardHeight, h: dockCard.height }
+    }
+
+    function maskRect() {
+      var cr = cardRect()
+      if (menuOpen) {
+        var mx = Math.min(ctxMenu.x, cr.x)
+        var my = Math.min(ctxMenu.y, cr.y)
+        var right = Math.max(ctxMenu.x + ctxMenu.width, cr.x + cr.w)
+        var bottom = Math.max(ctxMenu.y + ctxMenu.height, cr.y + cr.h)
+        return [mx, my, right - mx, bottom - my]
+      }
+      if (previewVisible) return [previewCard.x - 8, previewCard.y - 8, previewCard.width + 16, previewCard.height + 16]
+      if (pillVisible) return [pillItem.x - 8, pillItem.y - 8, pillItem.width + 16, pillItem.height + 16]
+      return [0, 0, 0, 0]
+    }
+
+    mask: Region {
+      property var r: popupPanel.maskRect()
+      x: r[0]
+      y: r[1]
+      width: r[2]
+      height: r[3]
+    }
+
+    Item {
+      id: popupRoot
+      anchors.fill: parent
+
+      // ---- tooltip (launcher names) ----
+      Rectangle {
+        id: tooltip
+        visible: popupPanel.tooltipVisible && dockCard.hoverSlotData !== null
+          && dockCard.hoverSlotData.isExtra !== true && !dockCard.hoverRunning
+        radius: Style.space(6)
+        color: Util.alpha(Color.tooltip.background, 0.95)
+        width: tooltipLabel.implicitWidth + Style.space(16)
+        height: tooltipLabel.implicitHeight + Style.space(8)
+        x: {
+          if (root.isHorizontal) {
+            var want = dockCard.x + dockCard.hoverX - width / 2
+            return Math.max(4, Math.min(want, popupRoot.width - width - 4))
+          }
+          var stack = (popupPanel.pillVisible && popupPanel.tooltipVisible) ? pillItem.width + Style.space(4) : 0
+          var tx = root.position === "left"
+            ? root.cardTopGap + stack
+            : popupRoot.width - root.cardTopGap - width - stack
+          return Math.max(4, Math.min(tx, popupRoot.width - width - 4))
+        }
+        y: {
+          if (root.isHorizontal) {
+            var stack2 = (popupPanel.pillVisible && popupPanel.tooltipVisible) ? pillItem.height + Style.space(4) : 0
+            return root.position === "bottom"
+              ? popupRoot.height - root.cardTopGap - height - stack2
+              : popupPanel.topInset + root.cardTopGap + stack2
+          }
+          var wantY = dockCard.y + dockCard.hoverX - height / 2
+          return Math.max(4, Math.min(wantY, popupRoot.height - height - 4))
+        }
+
+        Text {
+          id: tooltipLabel
+          anchors.centerIn: parent
+          text: (dockCard.hoverSlotData && dockCard.hoverSlotData.name) ? String(dockCard.hoverSlotData.name) : ""
+          color: Color.tooltip.text
+          font.family: Style.fontFamily
+          font.pixelSize: Style.font.bodySmall
+        }
+      }
+
+      // ---- unpin pill (pinned apps that are NOT running) ----
+      Rectangle {
+        id: pillItem
+
+        readonly property var buttons: {
+          var d = dockCard.hoverSlotData
+          var out = []
+          if (d === null || popupPanel.menuOpen) return out
+          if (!dockCard.hoverRunning && !dockCard.hoverIsExtra) out.push({ k: "unpin", l: "✕" })
+          return out
+        }
+
+        readonly property int btnSize: Style.space(26)
+        width: buttons.length * btnSize + Style.space(10)
+        height: btnSize + Style.space(8)
+        radius: Style.space(9)
+        color: Util.alpha(Color.popups.background, 0.98)
+        border.color: Util.alpha(Color.popups.border, 0.5)
+        border.width: 1
+        x: {
+          if (root.isHorizontal) {
+            var want = dockCard.x + dockCard.hoverX - width / 2
+            return Math.max(4, Math.min(want, popupRoot.width - width - 4))
+          }
+          var px = root.position === "left"
+            ? root.cardTopGap - Style.space(4)
+            : popupRoot.width - root.cardTopGap - width + Style.space(4)
+          return Math.max(4, Math.min(px, popupRoot.width - width - 4))
+        }
+        y: {
+          if (root.isHorizontal) {
+            return root.position === "bottom"
+              ? popupRoot.height - root.cardTopGap + Style.space(4) - height
+              : popupPanel.topInset + root.cardTopGap - Style.space(4)
+          }
+          var wantY = dockCard.y + dockCard.hoverX - height / 2
+          return Math.max(4, Math.min(wantY, popupRoot.height - height - 4))
+        }
+        visible: popupPanel.pillVisible && buttons.length > 0
+        z: 10
+
+        MouseArea {
+          id: pillMa
+          anchors.fill: parent
+          hoverEnabled: true
+          acceptedButtons: Qt.LeftButton
+          cursorShape: Qt.PointingHandCursor
+          onEntered: { dockCard.pillHover = true; dockCard.hoverHideTimer.stop() }
+          onExited: { dockCard.pillHover = false; dockCard.hoverHideTimer.restart() }
+        }
+
+        Flow {
+          x: Style.space(5)
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: 0
+          flow: Flow.LeftToRight
+
+          Repeater {
+            model: pillItem.buttons
+
+            delegate: Rectangle {
+              id: pillBtn
+              required property var modelData
+              width: pillItem.btnSize
+              height: pillItem.btnSize
+              radius: Style.space(6)
+              color: pillBtnMa.containsMouse ? Util.alpha(Color.accent, 0.25) : "transparent"
+
+              Text {
+                anchors.centerIn: parent
+                text: pillBtn.modelData.l
+                color: Color.popups.text
+                font.family: Style.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              MouseArea {
+                id: pillBtnMa
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: (mouse) => {
+                  mouse.accepted = true
+                  var d = dockCard.hoverSlotData
+                  if (d === null) return
+                  var kind = pillBtn.modelData.k
+                  if (kind === "unpin") root.unpinApp(String(d.id || ""))
+                  dockCard.hoverSlotData = null
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // ---- live window preview card (hover on a running app) ----
+      Rectangle {
+        id: previewCard
+
+        readonly property var d: dockCard.hoverSlotData
+        readonly property var tls: root.windowsFor(d)
+        readonly property string title: {
+          if (d === null) return ""
+          for (var i = 0; i < tls.length; i++) {
+            if (tls[i] && tls[i].activated === true) return String(tls[i].title || d.name)
+          }
+          return String((tls[0] && tls[0].title) || d.name || "")
+        }
+
+        readonly property var buttons: {
+          var out = []
+          if (d === null) return out
+          out.push({ k: "min", l: "–" })
+          out.push({ k: "max", l: "□" })
+          out.push({ k: "close", l: "✕" })
+          if (dockCard.hoverIsExtra) out.push({ k: "pin", l: "＋" })
+          return out
+        }
+
+        readonly property int headerH: Style.space(38)
+        readonly property int bodyH: Style.space(190)
+        width: Style.space(336)
+        height: headerH + bodyH + Style.space(10)
+        radius: Style.space(12)
+        color: Util.alpha(Color.popups.background, 0.98)
+        border.color: Util.alpha(Color.popups.border, 0.5)
+        border.width: 1
+        x: {
+          if (root.isHorizontal) {
+            var want = dockCard.x + dockCard.hoverX - width / 2
+            return Math.max(4, Math.min(want, popupRoot.width - width - 4))
+          }
+          var px = root.position === "left"
+            ? root.cardTopGap - Style.space(4)
+            : popupRoot.width - root.cardTopGap - width + Style.space(4)
+          return Math.max(4, Math.min(px, popupRoot.width - width - 4))
+        }
+        y: {
+          if (root.isHorizontal) {
+            return root.position === "bottom"
+              ? popupRoot.height - root.cardTopGap + Style.space(4) - height
+              : popupPanel.topInset + root.cardTopGap - Style.space(4)
+          }
+          var wantY = dockCard.y + dockCard.hoverX - height / 2
+          return Math.max(4, Math.min(wantY, popupRoot.height - height - 4))
+        }
+        visible: popupPanel.previewVisible && buttons.length > 0
+        z: 10
+        clip: true
+
+        MouseArea {
+          id: previewMa
+          anchors.fill: parent
+          hoverEnabled: true
+          acceptedButtons: Qt.LeftButton
+          cursorShape: Qt.PointingHandCursor
+          onEntered: { dockCard.pillHover = true; dockCard.hoverHideTimer.stop() }
+          onExited: { dockCard.pillHover = false; dockCard.hoverHideTimer.restart() }
+        }
+
+        // header: app icon + window title + window buttons
+        Item {
+          id: previewHeader
+          width: previewCard.width
+          height: previewCard.headerH
+
+          Rectangle {
+            id: headIconBg
+            x: Style.space(10)
+            anchors.verticalCenter: parent.verticalCenter
+            width: Style.space(22)
+            height: Style.space(22)
+            radius: Style.space(6)
+            color: Util.alpha(Color.accent, 0.15)
+
+            Image {
+              anchors.fill: parent
+              anchors.margins: Style.space(2)
+              fillMode: Image.PreserveAspectFit
+              smooth: true
+              mipmap: true
+              source: {
+                var ic = String(previewCard.d ? (previewCard.d.icon || "") : "")
+                if (!ic) return ""
+                if (ic.charAt(0) === "/") return "file://" + ic
+                try { var p = Quickshell.iconPath(ic, true); if (p) return p.charAt(0) === "/" ? "file://" + p : p } catch (e) {}
+                return "file://" + (Quickshell.env("HOME") || "") + "/.local/share/icons/Papirus/64x64/apps/" + ic + ".svg"
+              }
+            }
+          }
+
+          Text {
+            id: previewTitle
+            x: headIconBg.x + headIconBg.width + Style.space(8)
+            width: parent.width - x - (previewCard.buttons.length * Style.space(24) + Style.space(14)) - Style.space(10)
+            anchors.verticalCenter: parent.verticalCenter
+            text: previewCard.title
+            color: Color.popups.text
+            font.family: Style.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            elide: Text.ElideRight
+          }
+
+          Row {
+            anchors.right: parent.right
+            anchors.rightMargin: Style.space(6)
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 0
+
+            Repeater {
+              model: previewCard.buttons
+
+              delegate: Rectangle {
+                id: prevBtn
+                required property var modelData
+                width: Style.space(24)
+                height: Style.space(24)
+                radius: Style.space(6)
+                color: prevBtnMa.containsMouse ? Util.alpha(Color.accent, 0.25) : "transparent"
+
+                Text {
+                  anchors.centerIn: parent
+                  text: prevBtn.modelData.l
+                  color: Color.popups.text
+                  font.family: Style.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                MouseArea {
+                  id: prevBtnMa
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: (mouse) => {
+                    mouse.accepted = true
+                    var d = previewCard.d
+                    if (d === null) return
+                    var tls = root.windowsFor(d)
+                    var kind = prevBtn.modelData.k
+                    if (kind === "min") root.minimizeApp(d)
+                    else if (kind === "max") root.maximizeApp(d)
+                    else if (kind === "close") root.closeApp(tls)
+                    else if (kind === "pin") root.pinApp(d.entry ? d.entry.id : "")
+                    dockCard.hoverSlotData = null
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        // body: live snapshot of the window (fallback when unavailable)
+        Item {
+          x: Style.space(5)
+          y: previewCard.headerH + Style.space(4)
+          width: previewCard.width - Style.space(10)
+          height: previewCard.bodyH
+
+          Rectangle {
+            anchors.fill: parent
+            radius: Style.space(8)
+            color: Util.alpha("#000000", 0.35)
+            border.color: Util.alpha(Color.popups.border, 0.3)
+            border.width: 1
+          }
+
+          Image {
+            id: previewShot
+            anchors.fill: parent
+            anchors.margins: Style.space(1)
+            fillMode: Image.PreserveAspectFit
+            asynchronous: true
+            visible: root.previewTarget !== null && status === Image.Ready
+            source: root.previewTarget !== null
+              ? ("file://" + root.previewPath + "?v=" + root.previewSeq)
+              : ""
+            smooth: true
+          }
+
+          Text {
+            anchors.centerIn: parent
+            visible: !previewShot.visible
+            text: (previewCard.tls && previewCard.tls.length > 1)
+              ? previewCard.tls.length + " windows"
+              : "window preview"
+            color: Util.alpha(Color.popups.text, 0.7)
+            font.family: Style.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Rectangle {
+            visible: previewCard.tls.length > 1
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.margins: Style.space(6)
+            width: countLabel.implicitWidth + Style.space(10)
+            height: Style.space(18)
+            radius: Style.space(9)
+            color: Util.alpha(Color.popups.background, 0.9)
+            Text {
+              id: countLabel
+              anchors.centerIn: parent
+              text: previewCard.tls.length + " windows"
+              color: Color.popups.text
+              font.family: Style.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+          }
+        }
+      }
+
+      // ---- right-click context menu ----
+      Rectangle {
+        id: ctxMenu
 
         readonly property var menuRows: {
           var d = dockCard.menuData
           if (d === null) return []
+          var tls = root.windowsFor(d)
           var rows = []
-          var tls = (d.isExtra === true)
-            ? (root.runningAppIds[d.key] || [])
-            : (root.toplevelsFor(d) || [])
-          var canLaunch = d.isExtra !== true || (d.entry !== null && d.entry !== undefined)
-          if (canLaunch) rows.push({ kind: "launch", label: "New Window" })
+
           if (tls.length > 0) {
-            if (rows.length > 0) rows.push({ kind: "sep" })
-            for (var i = 0; i < tls.length && i < 8; i++) {
+            rows.push({ kind: "minimize", label: "Minimize" })
+            var best = null
+            for (var i = 0; i < tls.length; i++) {
+              var t = tls[i]
+              if (t && (t.fullscreen === true || t.maximized === true)) { best = t; break }
+            }
+            if (best === null) best = tls[0]
+            var maxed = false
+            try { maxed = (best.fullscreen === true || best.maximized === true) } catch (e) { maxed = false }
+            rows.push({ kind: "togglemax", label: maxed ? "Restore" : "Maximize" })
+            rows.push({ kind: "sep" })
+            for (i = 0; i < tls.length && i < root.menuMaxWindows; i++) {
               var title = String((tls[i] && tls[i].title) || "(untitled)")
-              if (title.length > 42) title = title.slice(0, 41) + "…"
+              if (title.length > 38) title = title.slice(0, 37) + "…"
               rows.push({ kind: "window", label: title, tl: tls[i] })
             }
             rows.push({ kind: "sep" })
-            rows.push({ kind: "quit",
-                        label: tls.length > 1 ? "Quit (" + tls.length + " windows)" : "Quit" })
           }
+
+          if (d.isExtra !== true || (d.entry && d.entry.id)) {
+            rows.push({ kind: "launch", label: "New Window" })
+            rows.push({ kind: "sep" })
+          }
+
+          if (tls.length > 0) {
+            rows.push({ kind: "close", label: tls.length > 1 ? "Close All" : "Close" })
+            rows.push({ kind: "forceclose", label: "Force Close" })
+            rows.push({ kind: "sep" })
+          }
+
           if (d.isExtra === true) {
             if (d.entry && d.entry.id) rows.push({ kind: "pin", label: "Pin to Dock" })
           } else {
             rows.push({ kind: "unpin", label: "Unpin from Dock" })
           }
+          while (rows.length > 0 && rows[rows.length - 1].kind === "sep") rows.pop()
           return rows
         }
 
@@ -954,18 +1513,20 @@ Item {
           var d = dockCard.menuData
           dockCard.menuData = null
           if (d === null || !row) return
+          var tls = root.windowsFor(d)
           if (row.kind === "window") {
             if (row.tl && typeof row.tl.activate === "function") row.tl.activate()
           } else if (row.kind === "launch") {
             var id = d.isExtra === true ? (d.entry ? d.entry.id : "") : d.id
-            if (id && root.appLibrary) root.appLibrary.launch(String(id), String(d.name || ""))
-          } else if (row.kind === "quit") {
-            var tls = (d.isExtra === true)
-              ? (root.runningAppIds[d.key] || [])
-              : (root.toplevelsFor(d) || [])
-            for (var i = 0; i < tls.length; i++) {
-              if (tls[i] && typeof tls[i].close === "function") tls[i].close()
-            }
+            if (id) root.launchApp(String(id), String(d.name || ""))
+          } else if (row.kind === "minimize") {
+            root.runWindowAction("minimize", tls)
+          } else if (row.kind === "togglemax") {
+            root.runWindowAction("togglemax", tls)
+          } else if (row.kind === "close") {
+            root.closeApp(tls)
+          } else if (row.kind === "forceclose") {
+            root.forceCloseApp(tls)
           } else if (row.kind === "pin") {
             root.pinApp(d.entry ? d.entry.id : "")
           } else if (row.kind === "unpin") {
@@ -973,10 +1534,6 @@ Item {
           }
         }
 
-        // Row sizing comes from measuring the longest label, NOT from the
-        // Column's implicit size: rows binding their width to the column
-        // while the column derives its size from the rows is a stable
-        // 0x0 deadlock (both start at zero and agree forever).
         readonly property string longestLabel: {
           var best = ""
           for (var i = 0; i < menuRows.length; i++) {
@@ -985,14 +1542,14 @@ Item {
           }
           return best
         }
-        readonly property real rowWidth: menuMetrics.width + Style.space(28)
+        readonly property real rowWidth: Math.max(menuMetrics.width + Style.space(60), Style.space(170))
         readonly property real rowHeight: menuMetrics.height + Style.space(12)
 
         TextMetrics {
           id: menuMetrics
           font.family: Style.fontFamily
           font.pixelSize: Style.font.bodySmall
-          text: contextMenu.longestLabel
+          text: ctxMenu.longestLabel
         }
 
         visible: dockCard.menuData !== null && menuRows.length > 0
@@ -1001,19 +1558,37 @@ Item {
         color: Util.alpha(Color.popups.background, 0.98)
         border.color: Util.alpha(Color.popups.border, 0.5)
         border.width: 1
-        width: rowWidth + Style.space(8)
+        width: rowWidth
         height: menuCol.implicitHeight + Style.space(8)
-        x: Math.max(0, Math.min(dockCard.menuX - width / 2, dockCard.width - width))
-        // Clamped so a long jump list can't run off the top of the screen
-        // (dockCard.y is the distance to the screen top in these coords).
-        y: Math.max(Style.space(4) - dockCard.y,
-                    dockCard.height - dockCard.cardHeight - height - Style.space(8))
+
+        x: {
+          if (root.isHorizontal) {
+            var want = dockCard.x + dockCard.menuX - width / 2
+            var minX = dockCard.x - Style.space(24)
+            var maxX = dockCard.x + dockCard.width - width + Style.space(24)
+            return Math.max(4, Math.min(want, Math.max(minX, maxX)))
+          }
+          var cx = root.position === "left"
+            ? root.cardTopGap
+            : popupRoot.width - root.cardTopGap - width
+          return Math.max(4, Math.min(cx, popupRoot.width - width - 4))
+        }
+        y: {
+          if (root.isHorizontal) {
+            return root.position === "bottom"
+              ? popupRoot.height - root.cardTopGap - height
+              : popupPanel.topInset + root.cardTopGap
+          }
+          var wantY = dockCard.y + dockCard.menuX - height / 2
+          return Math.max(4, Math.min(wantY, popupRoot.height - height - 4))
+        }
 
         MouseArea {
           id: menuHover
           anchors.fill: parent
           hoverEnabled: true
           acceptedButtons: Qt.NoButton
+          onEntered: menuCloseTimer.stop()
           onExited: menuCloseTimer.restart()
         }
 
@@ -1023,17 +1598,18 @@ Item {
           y: Style.space(4)
 
           Repeater {
-            model: contextMenu.menuRows
+            model: ctxMenu.menuRows
 
             delegate: Item {
               id: menuRow
               required property var modelData
               readonly property bool isSep: modelData.kind === "sep"
-              width: contextMenu.rowWidth
-              height: isSep ? Style.space(7) : contextMenu.rowHeight
+              readonly property bool isWindowRow: modelData.kind === "window"
+              width: ctxMenu.rowWidth
+              height: isSep ? Style.space(7) : ctxMenu.rowHeight
 
               Rectangle {
-                visible: menuRow.isSep
+                visible: isSep
                 anchors.centerIn: parent
                 width: parent.width - Style.space(8)
                 height: 1
@@ -1041,86 +1617,388 @@ Item {
               }
 
               Rectangle {
-                visible: !menuRow.isSep
+                visible: !isSep
                 anchors.fill: parent
                 radius: Style.space(6)
-                color: rowMa.containsMouse ? Style.hoverFill : "transparent"
+                color: rowMa.containsMouse && !winCloseMa.containsMouse ? Style.hoverFill : "transparent"
               }
 
               Text {
                 id: rowText
-                visible: !menuRow.isSep
+                visible: !isSep
                 anchors.verticalCenter: parent.verticalCenter
                 x: Style.space(14)
-                text: menuRow.isSep ? "" : menuRow.modelData.label
+                text: isSep ? "" : menuRow.modelData.label
                 color: Color.popups.text
                 font.family: Style.fontFamily
                 font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideRight
+                width: parent.width - Style.space(44)
               }
 
+              // full-row activator (declared before the ✕ so the ✕ gets priority)
               MouseArea {
                 id: rowMa
                 anchors.fill: parent
-                visible: !menuRow.isSep
-                enabled: !menuRow.isSep
+                visible: !isSep
+                enabled: !isSep
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
-                onClicked: contextMenu.doAction(menuRow.modelData)
+                onClicked: ctxMenu.doAction(menuRow.modelData)
+              }
+
+              // per-window close button (Windows jump-list style)
+              MouseArea {
+                id: winCloseMa
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+                width: Style.space(22)
+                height: parent.height - Style.space(8)
+                visible: isWindowRow
+                enabled: isWindowRow
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: (mouse) => {
+                  mouse.accepted = true
+                  if (menuRow.modelData.tl && typeof menuRow.modelData.tl.close === "function") {
+                    menuRow.modelData.tl.close()
+                  }
+                  dockCard.menuData = null
+                }
+
+                Text {
+                  anchors.centerIn: parent
+                  text: "✕"
+                  color: winCloseMa.containsMouse ? Color.accent : Color.popups.text
+                  font.family: Style.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  opacity: winCloseMa.containsMouse ? 1.0 : 0.55
+                }
               }
             }
           }
         }
       }
 
-      // Insertion indicator while dragging a pin.
-      Rectangle {
-        visible: dockCard.dragTargetIndex >= 0
-        width: Style.space(3)
-        height: dockCard.iconSize
-        radius: width / 2
-        color: Color.accent
-        z: 50
-        x: iconRow.x + dockCard.dragTargetIndex * (dockCard.iconSize + dockCard.iconGap)
-           - dockCard.iconGap / 2 - width / 2
-        y: dockCard.height - dockCard.cardHeight + dockCard.padY
-      }
-
-      // Grace period so the pointer can travel dock -> menu without the
-      // menu vanishing mid-flight.
       Timer {
         id: menuCloseTimer
-        interval: 300
+        interval: 500
+        onTriggered: dockCard.menuData = null
+      }
+
+      // hard cap: no popup stays on screen longer than popupTimeoutMs
+      Timer {
+        id: popupMaxTimer
+        interval: Math.max(2000, root.popupTimeoutMs)
         onTriggered: {
-          if (!hoverArea.containsMouse && !menuHover.containsMouse) dockCard.menuData = null
+          dockCard.hoverSlotData = null
+          dockCard.menuData = null
+          dockCard.pillHover = false
+          dockCard.slotHoverCount = 0
+        }
+      }
+
+      Connections {
+        target: dockCard
+        function onMenuDataChanged() {
+          if (dockCard.menuData !== null) {
+            menuCloseTimer.stop()
+            popupMaxTimer.restart()
+          }
         }
       }
     }
   }
 
-  // 2px reveal strip along the bottom screen edge, its own tiny layer
-  // surface (whole-surface input by default) — unioning a full-width
-  // strip into the main panel's single rectangular mask would swallow
-  // clicks beside the dock. Kept mapped the whole time autohide is on,
-  // NOT just while hidden: unmapping it under the pointer freezes its
-  // MouseArea's containsMouse at true (no exit event ever arrives), which
-  // pinned the dock open on the first live test.
+  // ------------------------------------------------------------ launcher overlay
+  // Launchpad-style full-screen app grid with instant search.
+
   PanelWindow {
-    id: revealWindow
+    id: launcherPanel
+    visible: root.launcherOpen
+    screen: root.targetScreen
+    anchors.left: true
+    anchors.right: true
+    anchors.top: true
+    anchors.bottom: true
+    color: "transparent"
+    WlrLayershell.namespace: "omarchy-dock-launcher"
+    WlrLayershell.layer: WlrLayer.Overlay
+    // Exclusive while open: typing goes straight to the search field
+    // (same contract as omarchy's own keyboard panel overlay).
+    WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
+    exclusionMode: ExclusionMode.Ignore
+    // Exact screen rect — matches omarchy's working overlay mask pattern.
+    mask: Region {
+      width: launcherPanel.screen ? launcherPanel.screen.width : 4096
+      height: launcherPanel.screen ? launcherPanel.screen.height : 4096
+    }
+
+    onVisibleChanged: {
+      if (visible) {
+        root.launcherQuery = ""
+        launcherSearch.text = ""
+        launcherSearch.forceActiveFocus()
+      } else {
+        launcherSearch.focus = false
+      }
+    }
+
+    // dimmed backdrop: ANY button press outside the card dismisses
+    Rectangle {
+      anchors.fill: parent
+      color: Util.alpha("#000000", 0.42)
+
+      MouseArea {
+        anchors.fill: parent
+        hoverEnabled: true
+        acceptedButtons: Qt.AllButtons
+        onPressed: (mouse) => {
+          mouse.accepted = true
+          root.launcherOpen = false
+        }
+      }
+    }
+
+    Rectangle {
+      id: launcherCard
+      width: Math.min(parent.width * 0.62, Style.space(920))
+      height: Math.min(parent.height * 0.72, Style.space(640))
+      anchors.centerIn: parent
+      radius: Style.space(16)
+      color: Util.alpha(Color.popups.background, 0.97)
+      border.color: Util.alpha(Color.accent, 0.25)
+      border.width: 1
+      clip: true
+
+      MouseArea { anchors.fill: parent; onClicked: launcherSearch.forceActiveFocus() }
+
+      Column {
+        x: Style.space(20)
+        y: Style.space(16)
+        width: parent.width - Style.space(40)
+        spacing: Style.space(12)
+
+        // search row
+        Rectangle {
+          width: parent.width
+          height: Style.space(42)
+          radius: Style.space(10)
+          color: Util.alpha(Color.popups.border, 0.25)
+          border.color: launcherSearch.activeFocus ? Util.alpha(Color.accent, 0.6) : Util.alpha(Color.popups.border, 0.3)
+          border.width: 1
+
+          Text {
+            x: Style.space(14)
+            anchors.verticalCenter: parent.verticalCenter
+            visible: launcherSearch.text.length === 0
+            text: "Search apps…"
+            color: Util.alpha(Color.popups.text, 0.5)
+            font.family: Style.fontFamily
+            font.pixelSize: Style.font.body
+          }
+
+          TextInput {
+            id: launcherSearch
+            x: Style.space(14)
+            width: parent.width - Style.space(28)
+            anchors.verticalCenter: parent.verticalCenter
+            color: Color.popups.text
+            font.family: Style.fontFamily
+            font.pixelSize: Style.font.body
+            clip: true
+            cursorVisible: activeFocus
+            onTextChanged: root.launcherQuery = text
+            Keys.onEscapePressed: root.launcherOpen = false
+            Keys.onReturnPressed: root.launchFromLauncher(root.launcherFiltered[0])
+            Keys.onEnterPressed: root.launchFromLauncher(root.launcherFiltered[0])
+          }
+        }
+
+        // app grid
+        Flickable {
+          width: parent.width
+          height: launcherCard.height - Style.space(16) - Style.space(42) - Style.space(12)
+          clip: true
+          contentWidth: width
+          contentHeight: launcherGrid.implicitHeight + Style.space(20)
+          boundsBehavior: Flickable.StopAtBounds
+
+          Grid {
+            id: launcherGrid
+            width: parent.width
+            columns: Math.max(3, Math.floor(width / Style.space(112)))
+            spacing: Style.space(6)
+
+            Repeater {
+              model: root.launcherFiltered
+
+              delegate: Item {
+                id: appTile
+                required property var modelData
+                required property int index
+                readonly property bool lastCol: (index + 1) % launcherGrid.columns === 0
+                width: launcherGrid.width / launcherGrid.columns - launcherGrid.spacing
+                  + (lastCol ? launcherGrid.spacing : 0)
+                height: Style.space(96)
+
+                Rectangle {
+                  id: tileBg
+                  anchors.fill: parent
+                  radius: Style.space(10)
+                  color: tileMa.containsMouse ? Util.alpha(Color.accent, 0.18) : "transparent"
+                }
+
+                // centered content block — explicit height so vertical centering
+                // is exact math (a plain Column+anchors mis-centers here)
+                Item {
+                  id: tileContent
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width
+                  height: Style.space(48) + Style.space(7) + tileLabel.implicitHeight
+
+                  Item {
+                    id: iconBox
+                    width: Style.space(48)
+                    height: Style.space(48)
+                    anchors.top: parent.top
+                    anchors.horizontalCenter: parent.horizontalCenter
+
+                    Image {
+                      id: tileIcon
+                      anchors.fill: parent
+                      fillMode: Image.PreserveAspectFit
+                      asynchronous: true
+                      sourceSize.width: 128
+                      sourceSize.height: 128
+                      smooth: true
+                      mipmap: true
+
+                      readonly property string themedPath: {
+                        var ic = String(appTile.modelData.icon || "")
+                        if (!ic) return ""
+                        if (ic.charAt(0) === "/") return "file://" + ic
+                        try { var p = Quickshell.iconPath(ic, true); if (p) return p.charAt(0) === "/" ? "file://" + p : p } catch (e) {}
+                        return root.appLibrary ? root.appLibrary.iconSource(ic) : ""
+                      }
+                      readonly property string genericPath: {
+                        try { var p = Quickshell.iconPath("application-x-executable", true); if (p) return p.charAt(0) === "/" ? "file://" + p : p } catch (e) {}
+                        return "file://" + (Quickshell.env("HOME") || "") + "/.local/share/icons/Papirus/64x64/apps/application-default-icon.svg"
+                      }
+                      readonly property var candidates: {
+                        var ic = String(appTile.modelData.icon || "")
+                        var out = []
+                        if (themedPath) out.push(themedPath)
+                        if (ic.length > 0) {
+                          out.push("file://" + (Quickshell.env("HOME") || "") + "/.local/share/icons/Papirus/64x64/apps/" + ic + ".svg")
+                          out.push("file://" + (Quickshell.env("HOME") || "") + "/.local/share/icons/Papirus/64x64/apps/" + ic + ".png")
+                          out.push("file://" + (Quickshell.env("HOME") || "") + "/.local/share/icons/hicolor/512x512/apps/" + ic + ".png")
+                        }
+                        out.push(genericPath)
+                        return out
+                      }
+                      property int stage: 0
+                      onCandidatesChanged: stage = 0
+                      source: candidates[Math.min(stage, candidates.length - 1)]
+                      onStatusChanged: { if (status === Image.Error && stage < candidates.length - 1) stage += 1 }
+                    }
+                  }
+
+                  Text {
+                    id: tileLabel
+                    width: appTile.width - Style.space(8)
+                    anchors.top: iconBox.bottom
+                    anchors.topMargin: Style.space(7)
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    text: appTile.modelData.name
+                    color: Color.popups.text
+                    font.family: Style.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideRight
+                    horizontalAlignment: Text.AlignHCenter
+                  }
+                }
+
+                MouseArea {
+                  id: tileMa
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.launchFromLauncher(appTile.modelData)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------------------------ autohide reveal strip
+  // Thin input-only strip at the dock edge; touching it reveals the dock.
+
+  PanelWindow {
+    id: revealStrip
     visible: root.autohide
     screen: root.targetScreen
-    anchors { bottom: true; left: true; right: true }
-    implicitHeight: 2
+    anchors.bottom: root.position === "bottom" || root.isSide
+    anchors.top: root.position === "top" || root.isSide
+    anchors.left: root.position === "left" || root.isHorizontal
+    anchors.right: root.position === "right" || root.isHorizontal
+    implicitWidth: root.isHorizontal ? 0 : Style.space(4)
+    implicitHeight: root.isHorizontal ? Style.space(4) : 0
     color: "transparent"
     WlrLayershell.namespace: "omarchy-dock-reveal"
     WlrLayershell.layer: WlrLayer.Top
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
+    mask: Region { x: 0; y: 0; width: 4096; height: 4096 }
 
     MouseArea {
-      id: edgeMa
       anchors.fill: parent
       hoverEnabled: true
       acceptedButtons: Qt.NoButton
+      cursorShape: Qt.ArrowCursor
+      onContainsMouseChanged: {
+        if (containsMouse) {
+          root.revealed = true
+          revealTimer.stop()
+        } else {
+          revealTimer.restart()
+        }
+      }
+    }
+  }
+
+  property bool revealed: false
+
+  onRevealedChanged: {
+    if (!revealed) {
+      dockCard.hoverSlotData = null
+      dockCard.menuData = null
+      dockCard.pillHover = false
+      dockCard.slotHoverCount = 0
+    }
+  }
+
+  Timer {
+    id: revealTimer
+    interval: 800
+    onTriggered: {
+      if (dockCard.slotHoverCount <= 0 && !dockCard.pillHover && dockCard.menuData === null)
+        root.revealed = false
+    }
+  }
+
+  Connections {
+    target: dockCard
+    function onMenuDataChanged() {
+      if (dockCard.menuData !== null) root.revealed = true
+    }
+    function onHoverSlotDataChanged() {
+      if (dockCard.hoverSlotData !== null) root.revealed = true
     }
   }
 }

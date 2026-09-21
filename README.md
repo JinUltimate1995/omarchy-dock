@@ -2,7 +2,9 @@
 
 A floating dock for [Omarchy](https://omarchy.org) — a
 mouse-first way to launch, switch, and manage apps on a keyboard-first
-desktop.
+desktop. Familiar if you come from macOS or Windows: one dock for
+everything, window previews on hover, a real start-menu launcher, and a
+taskbar that behaves the way you already expect.
 
 Built as a native `omarchy-shell` plugin, the same technology as
 Omarchy's bar and OSD, so it follows your theme automatically and
@@ -10,10 +12,12 @@ survives theme switches without configuration.
 
 ![Floating Dock](screenshot.jpg)
 
+![Window preview on hover](docs/screenshots/menu.png)
+
 ## Features
 
-- **Pinned launchers** in a glassy capsule at the bottom of the screen,
-  with hover magnification and a launch bounce.
+- **Pinned launchers** in a glassy capsule, with hover magnification and
+  a launch bounce.
 - **Every running app is in the dock**, pinned or not — unpinned apps
   appear to the right of a divider, macOS style, so any open program is
   one click away no matter how it was launched.
@@ -21,20 +25,34 @@ survives theme switches without configuration.
   you to its window wherever it lives; the compositor switches
   workspaces for you. Clicking again cycles through that app's other
   windows.
-- **A real right-click menu** — *New Window*, a jump list of the app's
-  open windows by title, *Quit*, and *Pin / Unpin*.
+- **Hover window previews** — hovering a running app shows a live
+  snapshot of its focused window with working **Minimize / Maximize /
+  Close** buttons, like the macOS Dock and the Windows 11 taskbar.
+- **A real right-click menu** — *Minimize*, *Maximize*, *New Window*, a
+  jump list of the app's open windows by title, *Quit*, and *Pin /
+  Unpin*.
+- **App launcher** — a Launchpad-style popup with an app grid and a
+  type-to-filter search field. Click the grid icon (or press its
+  keybind), type part of an app's name, hit Enter. ESC or a click
+  outside closes it.
+- **Four placements** — bottom, left, right, or top. On top it sits
+  below Omarchy's own bar (the bar keeps the screen edge, always).
+- **Minimize and restore** — right-click (or hover the preview) and use
+  Minimize; click the dock icon to restore it to your current workspace.
 - **Drag to reorder** pinned icons; the order persists.
-- **Auto-hide** (on by default) — the dock slides off-screen when you're
-  not using it and slides back when the pointer touches the bottom edge,
-  so it never sits on top of your tiled windows.
-- **Running indicators** — an accent-colored dot under every app with an
-  open window.
+- **Auto-hide** — the dock slides off-screen when you're not using it
+  and slides back when the pointer touches its edge (off by default).
+- **Running indicators** — an accent-colored ring around every app with
+  an open window (no more guessing whether it's running).
+- **Popups can't hang around** — hover cards and menus dismiss on
+  pointer-leave and are force-closed after 30 seconds no matter what.
 - **Theme-aware** — colors derive from the active Omarchy theme, with a
   toned-down treatment on light themes.
 
-Everything above is driven by stable Wayland protocols
-(foreign-toplevel management), not compositor-specific APIs — see
-[Design notes](#design-notes) for what that buys you.
+Window tracking, focusing, cycling, previews, and closing all ride on
+stable Wayland protocols (foreign-toplevel management), not
+compositor-specific APIs — see [Design notes](#design-notes) for what
+that buys you and where the two Hyprland-bound pieces live.
 
 ## Requirements
 
@@ -71,12 +89,17 @@ To update later: `omarchy plugin update dino.dock`.
 |---|---|
 | **Click** a pinned app | Focuses its window (switching workspaces if needed), or launches it if it isn't running |
 | **Click** a running app again | Cycles to that app's next window |
+| **Click** a minimized app | Restores it to the workspace you're on |
 | **Click** an unpinned running app | Focuses it — same as a pinned one |
-| **Right-click** any icon | Menu: *New Window* · window jump list · *Quit* · *Pin / Unpin* |
+| **Hover** a running app | Window preview card: live snapshot + Minimize / Maximize / Close |
+| **Hover** a pinned, not-running app | Small pill with ✕ to unpin |
+| **Right-click** any icon | Menu: *Minimize* · *Maximize* · *New Window* · window jump list · *Quit* · *Pin / Unpin* |
 | **Click a title** in the jump list | Focuses exactly that window, wherever it is |
 | **Quit** | Closes every window of that app (via the window-management protocol — the app can still prompt to save) |
+| **Grid icon** (leftmost) | Opens the app launcher: search field + app grid |
+| **Type in the launcher** | Filters the grid live; **Enter** launches the first match, **ESC** / click outside closes |
 | **Drag** a pinned icon left/right | Reorders it; an accent bar previews where it will land |
-| **Pointer to the bottom screen edge** | Reveals the dock when auto-hidden |
+| **Pointer to the dock's screen edge** | Reveals the dock when auto-hidden |
 
 Notes on behavior:
 
@@ -155,19 +178,29 @@ file, or an empty one, means no preference.
 
 ### Settings — `dino.dock.settings.json`
 
-One knob today:
+Three knobs:
 
 ```json
-{ "autohide": false }
+{ "position": "bottom", "autohide": false, "popupTimeoutMs": 30000 }
 ```
 
-`autohide` defaults to **true**: the dock hides about 0.7s after the
-pointer leaves it and reveals when the pointer touches the bottom screen
-edge. While auto-hide is on, a 2-pixel strip along the very bottom of
-the screen is reserved to catch the reveal — the standard hidden-taskbar
-trade-off. An open right-click menu or an in-flight drag always holds
-the dock on screen. Set `autohide` to `false` for a dock that's always
-visible.
+- `position` — `bottom` (default), `top`, `left`, or `right`. On **top**,
+  Omarchy's own bar stays at the screen edge and the dock sits directly
+  below it; on the sides the dock is a vertical strip.
+- `autohide` — defaults to **false** (a normal, always-visible dock/taskbar).
+  When set to `true`, the dock hides about 0.7s after the pointer leaves it
+  and reveals when the pointer touches the dock's screen edge. While
+  auto-hide is on, a 2-pixel strip along that edge is reserved to catch the
+  reveal — the standard hidden-taskbar trade-off. An open right-click menu,
+  a window preview, or an in-flight drag always holds the dock on screen.
+- `popupTimeoutMs` — the lifetime cap for hover previews and menus in
+  milliseconds (default `30000`, minimum `1000`). Whatever happens, a
+  popup is force-closed at the cap so nothing can linger indefinitely.
+
+All three files hot-reload on save. Placements screenshot set:
+[left](docs/screenshots/placement-left.png) ·
+[right](docs/screenshots/placement-right.png) ·
+[top](docs/screenshots/placement-top.png).
 
 ## Design notes
 
@@ -190,48 +223,64 @@ deliberately exact, never substring-fuzzy: `code` can never claim
 back to your icon theme, then to a generic tile — so a window that ships
 no icon at all still gets a clickable, visible slot.
 
-### Why there's no Minimize (yet)
+### Why minimize goes through a helper
 
-Minimize is designed and proven, but deliberately not shipped. Hyprland
-has no native minimize; the working equivalent is parking a window in a
-hidden special workspace — the same mechanism as Omarchy's scratchpad
-(SUPER + S):
+Everything portable — window tracking, focusing, cycling, closing —
+rides on the foreign-toplevel protocol. Minimize and Maximize can't:
+Hyprland 0.56 has no native minimize, and its `hyprctl dispatch`
+interface is now evaluated as Lua by the embedded interpreter, which is
+fast-moving and not stable protocol surface. So the two Hyprland-bound
+actions live in one small, auditable Python helper, `dock_helper.py`:
 
-```lua
--- park (minimize), no focus change:
-hl.dispatch(hl.dsp.window.move({ workspace = "special:minimized",
-                                 follow = false, window = w }))
--- restore to whatever workspace you're on now:
-hl.dispatch(hl.dsp.window.move({ workspace = tostring(hl.get_active_workspace().id),
-                                 follow = false, window = w }))
-```
+- **Minimize** parks the window in the `special:scratchpad` workspace —
+  the same mechanism as Omarchy's scratchpad (SUPER + S). Nothing is
+  killed, the app keeps state.
+- **Restore** moves it back to the workspace you're actually on, then
+  focuses it.
+- **Maximize/Fullscreen** toggles Hyprland's fullscreen mode.
 
-The dock version would be a *Minimize* item in the right-click menu
-(macOS "Hide" semantics — all of an app's windows park, its icon dims,
-clicking restores to your current workspace).
+Clicking a dock icon of a minimized app also restores it. If a future
+Wayland protocol grows a portable minimize, the helper shrinks away and
+the dock code doesn't change.
 
-The reason it's not implemented: everything else in this dock rides on
-stable Wayland protocols and survives compositor upgrades untouched.
-Minimize would be the one feature bound to Hyprland's embedded Lua API —
-a young, fork-specific surface that already broke the classic `hyprctl
-dispatch` syntax and can shift again with any Omarchy Hyprland bump. One
-feature silently breaking on upgrade would cost more trust than minimize
-is worth. If that API settles (or a portable minimize lands in a Wayland
-protocol), the recipe above is the whole implementation — PRs welcome.
+### How window previews work
+
+Hovering a running app asks the helper for window geometry (position,
+size, workspace), picks the app's focused window on your current
+workspace, and grabs that region with `grim` — the same way Omarchy's
+own screenshot tool works. The snapshot is what you see in the preview
+card; the – / □ / ✕ buttons in its header are real window actions.
+Previews are snapshots, not live mirrors — a still frame refreshed on
+hover, like a lightweight taskbar preview.
+
+### How the launcher works
+
+The launcher is a layer-shell overlay: it takes keyboard focus while
+open, so typing goes straight to its search field. ESC or a click
+outside closes it, and Enter launches the top match. The grid is your
+installed desktop entries (hidden entries filtered); the search matches
+app names, so "calc" finds LibreOffice Calc. The *pin* matching that
+decides which icon a running window belongs to stays exact — desktop
+entry ID plus `StartupWMClass`, never substring-fuzzy, so a short query
+can't light the wrong pin.
 
 ## Troubleshooting
 
-- **No running dot for an app** — its `app_id` doesn't match its desktop
+- **No running ring for an app** — its `app_id` doesn't match its desktop
   entry by any of the rules above. Fix it at the source: add
   `StartupWMClass=<its app_id>` to the app's `.desktop` file. Find the
   `app_id` with `hyprctl clients -j | grep class`.
 - **An app shows a generic gear icon** — it resolves to no icon in
   Papirus, your theme, or its desktop entry. Same fix: give its desktop
   entry an `Icon=`.
+- **Minimize/Maximize does nothing** — check the helper runs:
+  `/usr/bin/python3 ~/.config/omarchy/plugins/dino.dock/dock_helper.py`
+  with no arguments should print its usage. `grim` must be installed
+  (it ships with Omarchy) for the hover previews.
 - **Dock is on the wrong monitor** — set
   `~/.config/omarchy/dino.dock.monitor.json` (see above).
 - **Dock seems gone** — auto-hide is probably on; push the pointer to
-  the bottom screen edge. If it truly isn't there, check
+  the dock's screen edge. If it truly isn't there, check
   `omarchy plugin list` and the shell log under
   `/run/user/$UID/quickshell/by-id/*/log.log` for `dino.dock` errors.
 - **Edited a config file and the whole dock blinked** — you edited the
@@ -253,7 +302,11 @@ or manually: delete the plugin directory and remove the
 
 - `manifest.json` — plugin manifest (kind `panel`, `keepLoaded: true`:
   mounted at shell startup and stays up, like the OSD).
-- `Dock.qml` — the entire implementation.
+- `Dock.qml` — the dock, popup, hover previews, launcher: the entire UI.
+- `dock_helper.py` — the two Hyprland-bound window actions (minimize /
+  maximize / geometry for previews), one auditable file, no state.
+- `assets/omarchy-launcher.svg` — the launcher glyph, drawn to match the
+  Papirus style.
 - `pinned.json` (in-repo) — first-run defaults, and the legacy fallback
   read until your `~/.config/omarchy/dino.dock.pinned.json` exists.
 - `~/.config/omarchy/dino.dock.pinned.json` — your pins (managed by
@@ -261,7 +314,19 @@ or manually: delete the plugin directory and remove the
 - `~/.config/omarchy/dino.dock.monitor.json` — optional monitor
   targeting.
 - `~/.config/omarchy/dino.dock.settings.json` — optional settings
-  (currently `autohide`).
+  (`position`, `autohide`, `popupTimeoutMs`).
+
+## Contributing & support
+
+PRs are welcome — the plugin is ~2,000 lines of QML plus one helper
+script, and deliberately avoids inventing anything the Wayland
+protocols already cover. If this saved you from memorizing yet another
+shortcut, you can sponsor development:
+
+- GitHub Sponsors: [github.com/sponsors/JinUltimate1995](https://github.com/sponsors/JinUltimate1995)
+- Or star the repo and tell other Omarchy users — that's support too.
+
+See `FUNDING.yml` and `CONTRIBUTING.md`.
 
 ## License
 

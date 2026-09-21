@@ -1,0 +1,7 @@
+# local backups and editor droppings
+*.bak*
+*.bak
+*.tmp
+*.swp
+# runtime probes should never be committed
+/tmp/

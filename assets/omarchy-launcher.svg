@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- dino.dock launcher glyph: 2x2 rounded-square grid, Launchpad style -->
+  <rect x="8"  y="8"  width="22" height="22" rx="6" fill="#8b7dff" fill-opacity="0.45"/>
+  <rect x="34" y="8"  width="22" height="22" rx="6" fill="#8b7dff" fill-opacity="1.0"/>
+  <rect x="8"  y="34" width="22" height="22" rx="6" fill="#8b7dff" fill-opacity="0.45"/>
+  <rect x="34" y="34" width="22" height="22" rx="6" fill="#8b7dff" fill-opacity="0.45"/>
+</svg>
