@@ -21,10 +21,10 @@ survives theme switches without configuration.
 - **Every running app is in the dock**, pinned or not — unpinned apps
   appear to the right of a divider, macOS style, so any open program is
   one click away no matter how it was launched.
-- **Click to focus, across workspaces** — clicking a running app takes
-  you to its window wherever it lives; the compositor switches
-  workspaces for you. Clicking again cycles through that app's other
-  windows.
+- **Click to focus, minimize to tuck away** — clicking a running app
+  takes you to its window wherever it lives; the compositor switches
+  workspaces for you. Clicking the app you're already using minimizes
+  it, exactly like the Windows 11 taskbar and the macOS Dock.
 - **Hover window previews** — hovering a running app shows a live
   snapshot of its focused window with working **Minimize / Maximize /
   Close** buttons, like the macOS Dock and the Windows 11 taskbar.
@@ -87,10 +87,10 @@ To update later: `omarchy plugin update dino.dock`.
 
 | Action | Result |
 |---|---|
-| **Click** a pinned app | Focuses its window (switching workspaces if needed), or launches it if it isn't running |
-| **Click** a running app again | Cycles to that app's next window |
+| **Click** an app that isn't open | Launches it |
+| **Click** a running app in the background | Brings it to you (switching workspaces if needed) |
+| **Click** the app you're currently using | Minimizes it — Windows 11 / macOS taskbar toggle |
 | **Click** a minimized app | Restores it to the workspace you're on |
-| **Click** an unpinned running app | Focuses it — same as a pinned one |
 | **Hover** a running app | Window preview card: live snapshot + Minimize / Maximize / Close |
 | **Hover** a pinned, not-running app | Small pill with ✕ to unpin |
 | **Right-click** any icon | Menu: *Minimize* · *Maximize* · *New Window* · window jump list · *Quit* · *Pin / Unpin* |

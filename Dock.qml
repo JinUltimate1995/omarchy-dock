@@ -313,7 +313,9 @@ Item {
       for (var i = 0; i < toplevels.length; i++) {
         if (toplevels[i] && toplevels[i].activated === true) { anyActive = true; break }
       }
-      if (anyActive) root.focusNext(toplevels)
+      // Windows 11 / macOS taskbar semantics: clicking the icon of the app
+      // you're already looking at minimizes it; clicking again brings it back.
+      if (anyActive) root.runWindowAction("minimize", toplevels)
       else root.restoreApp(toplevels)
     } else if (!pin.isExtra) {
       root.launchApp(pin.id, pin.name)
@@ -568,8 +570,8 @@ Item {
   readonly property int iconSize: Style.space(36)
   readonly property int iconGap: Style.space(6)
   readonly property int padX: Style.space(10)
-  readonly property int padY: Style.space(6)
-  readonly property int appsBtnWidth: Style.space(40)
+  readonly property int padY: Style.space(8)
+  readonly property int appsBtnWidth: Style.space(36)   // same rhythm as icon slots
   readonly property int cardHeight: iconSize + padY * 2   // card thickness (perpendicular)
   readonly property int panelHeight: cardHeight + Style.space(16)
 
@@ -787,8 +789,8 @@ Item {
           Item {
             id: launcherGlyph
             anchors.centerIn: parent
-            width: Style.space(18)
-            height: Style.space(18)
+            width: Style.space(24)
+            height: Style.space(24)
 
             readonly property real cell: (width - Style.space(4)) / 2
             readonly property real bright: appsBtnMa.containsMouse ? 1.0 : 0.0
@@ -799,7 +801,7 @@ Item {
               width: launcherGlyph.cell; height: launcherGlyph.cell
               radius: Style.space(3)
               color: Color.accent
-              opacity: 0.45 + 0.55 * launcherGlyph.bright
+              opacity: 0.85 + 0.15 * launcherGlyph.bright
             }
             Rectangle {
               x: launcherGlyph.cell + Style.space(4); y: 0
@@ -813,14 +815,14 @@ Item {
               width: launcherGlyph.cell; height: launcherGlyph.cell
               radius: Style.space(3)
               color: Color.accent
-              opacity: 0.45 + 0.35 * launcherGlyph.bright
+              opacity: 0.75 + 0.25 * launcherGlyph.bright
             }
             Rectangle {
               x: launcherGlyph.cell + Style.space(4); y: launcherGlyph.cell + Style.space(4)
               width: launcherGlyph.cell; height: launcherGlyph.cell
               radius: Style.space(3)
               color: Color.accent
-              opacity: 0.45 + 0.35 * launcherGlyph.bright
+              opacity: 0.75 + 0.25 * launcherGlyph.bright
             }
           }
 
