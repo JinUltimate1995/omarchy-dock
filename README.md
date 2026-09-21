@@ -1,10 +1,11 @@
 # Floating Dock
 
-A floating dock for [Omarchy](https://omarchy.org) — a
-mouse-first way to launch, switch, and manage apps on a keyboard-first
-desktop. Familiar if you come from macOS or Windows: one dock for
-everything, window previews on hover, a real start-menu launcher, and a
-taskbar that behaves the way you already expect.
+A floating dock for [Omarchy](https://omarchy.org) — the easy way to
+use Omarchy. Omarchy is a keyboard-first desktop; this gives it the
+mouse-first, point-and-click surface you know from macOS or Windows:
+one dock for everything, window previews on hover, a real start-menu
+launcher, and a taskbar that behaves the way you already expect. No
+keybind memorization required to get around.
 
 Built as a native `omarchy-shell` plugin, the same technology as
 Omarchy's bar and OSD, so it follows your theme automatically and
@@ -197,10 +198,14 @@ Three knobs:
   milliseconds (default `30000`, minimum `1000`). Whatever happens, a
   popup is force-closed at the cap so nothing can linger indefinitely.
 
-All three files hot-reload on save. Placements screenshot set:
-[left](docs/screenshots/placement-left.png) ·
-[right](docs/screenshots/placement-right.png) ·
-[top](docs/screenshots/placement-top.png).
+All three files hot-reload on save. Four placements — pick the edge that
+suits you:
+
+| Bottom | Left |
+|:---:|:---:|
+| ![bottom](docs/screenshots/placement-bottom.png) | ![left](docs/screenshots/placement-left.png) |
+| **Top** | **Right** |
+| ![top](docs/screenshots/placement-top.png) | ![right](docs/screenshots/placement-right.png) |
 
 ## Design notes
 
