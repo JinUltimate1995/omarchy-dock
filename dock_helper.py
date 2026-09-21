@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """dino.dock - window action helper (called by Dock.qml via Quickshell.execDetached).
 
-Hyprland 0.56 routes every IPC `dispatch` through its Lua evaluator, so all
-window-targeted actions are sent as Lua expressions operating on HL.Window
-objects (verified live on this system):
-  hl.dsp.window.move({ window = w, workspace = 'special:scratchpad' })  -> minimize
-  hl.dsp.focus({ window = w })                                          -> restore/reveal
-  hl.dsp.window.fullscreen({ window = w, mode = 0 })                    -> maximize toggle (bar-respecting, JSON fullscreen==2)
-  hl.dsp.window.fullscreen({ window = w, mode = 1 })                    -> real fullscreen toggle (JSON fullscreen==1)
+Hyprland 0.56 routes every IPC `dispatch` through its Lua evaluator. All
+window-targeted actions use the DOCUMENTED Lua dispatch API with exact
+window selectors (https://wiki.hypr.land/Configuring/Basics/Dispatchers/):
+  hl.dsp.focus({ window = "address:0x..." })                            -> focus
+  hl.dsp.window.move({ window = "address:0x...", workspace = "special:scratchpad" })  -> minimize
+  hl.dsp.window.fullscreen({ window = "address:0x...", mode = 0, layout_aware = true }) -> maximize (bar-respecting)
+  hl.dsp.window.fullscreen({ window = "address:0x...", mode = 1, layout_aware = true }) -> real fullscreen
+  hl.dsp.window.alter_zorder({ window = "address:0x...", mode = "top" }) -> raise above floats
+
+The socket's `dispatch` command wraps the expression in hl.dispatch() itself,
+so the Lua sent here must NOT include an outer hl.dispatch() call.
 
 Usage: dock_helper.py <action> <pids-csv> <class>
   actions: minimize | restore | togglemax
@@ -72,11 +76,34 @@ def active_ws_id():
         return -1
 
 
-def lua_for_window(addr, call):
-    # one dispatch per window; the finder is inlined so no state crosses calls
-    a = str(addr).replace("\\", "\\\\").replace("'", "\\'")
-    return ("(function() for _,w in ipairs(hl.get_windows()) do "
-            "if w.address=='" + a + "' then return " + call + " end end end)()")
+def sel(addr):
+    # exact window selector per the Dispatchers docs; hyprctl addresses are
+    # plain "0x..." hex strings.
+    return "address:" + str(addr)
+
+
+def lua_minimize(addr):
+    return ("hl.dsp.window.move({ window = \"" + sel(addr) +
+            "\", workspace = \"special:scratchpad\" })")
+
+
+def lua_focus(addr):
+    return "hl.dsp.focus({ window = \"" + sel(addr) + "\" })"
+
+
+def lua_restore(addr, ws):
+    return ("hl.dsp.window.move({ window = \"" + sel(addr) +
+            "\", workspace = \"" + str(ws) + "\", follow = false })")
+
+
+def lua_fullscreen(addr, mode):
+    return ("hl.dsp.window.fullscreen({ window = \"" + sel(addr) +
+            "\", mode = " + str(mode) + ", layout_aware = true })")
+
+
+def lua_raisetop(addr):
+    return ("hl.dsp.window.alter_zorder({ window = \"" + sel(addr) +
+            "\", mode = \"top\" })")
 
 
 def main():
@@ -141,14 +168,10 @@ def main():
 
     if action == "minimize":
         rc = 0
-        n = 0
         for c in matched:
-            r = ipc(lua_for_window(c["address"],
-                "hl.dsp.window.move({ window=w, workspace='special:scratchpad' })"))
+            r = ipc(lua_minimize(c["address"]))
             print(f"minimize {c['address'][-4:]}: {r}")
-            if r.startswith("ok"):
-                pass
-            else:
+            if not r.startswith("ok"):
                 rc = 4
         return rc
 
@@ -158,14 +181,15 @@ def main():
 
     if action == "restore":
         # bring the window back onto the workspace the user is actually on:
-        # move it out of the scratchpad first, then focus it.
+        # move it out of the scratchpad first, then focus it. NOTE: do NOT
+        # alter_zorder after focusing — that dispatcher STEALS focus
+        # (verified live); focusing a tiled window already raises it.
         ws = active_ws_id()
         if ws is not None and ws >= 0:
-            r1 = ipc(lua_for_window(addr,
-                f"hl.dsp.window.move({{ window=w, workspace='{ws}', follow=false }})"))
+            r1 = ipc(lua_restore(addr, ws))
         else:
             r1 = "ok(no-ws)"
-        r2 = ipc(lua_for_window(addr, "hl.dsp.focus({ window=w })"))
+        r2 = ipc(lua_focus(addr))
         return report("restore", r2 if r2.startswith("ok") else r1)
 
     if action == "togglemax":
@@ -173,14 +197,14 @@ def main():
         wsname = str((target.get("workspace") or {}).get("name") or "")
         on_special = wsname.startswith("special:")
         if on_special:
-            report("reveal", ipc(lua_for_window(addr, "hl.dsp.focus({ window=w })")))
-            r = ipc(lua_for_window(addr, "hl.dsp.window.fullscreen({ window=w, mode=0 })"))
+            report("reveal", ipc(lua_focus(addr)))
+            r = ipc(lua_fullscreen(addr, 0))
         elif fs == 2:
-            r = ipc(lua_for_window(addr, "hl.dsp.window.fullscreen({ window=w, mode=0 })"))
+            r = ipc(lua_fullscreen(addr, 0))
         elif fs == 1:
-            r = ipc(lua_for_window(addr, "hl.dsp.window.fullscreen({ window=w, mode=1 })"))
+            r = ipc(lua_fullscreen(addr, 1))
         else:
-            r = ipc(lua_for_window(addr, "hl.dsp.window.fullscreen({ window=w, mode=0 })"))
+            r = ipc(lua_fullscreen(addr, 0))
         print(f"togglemax {addr[-4:]} (fs was {fs}): {r}")
         return 0 if r.startswith("ok") else 4
 

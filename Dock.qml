@@ -738,6 +738,11 @@ Item {
         if (hoverSlotData === data) hoverHideTimer.restart()
       }
 
+      // ids are NOT reachable as properties from other scopes/scenes
+      // (popup panel MouseAreas), so wrap timer access in functions.
+      function hoverHideTimerStop() { hoverHideTimer.stop() }
+      function hoverHideTimerRestart() { hoverHideTimer.restart() }
+
       Timer {
         id: hoverHideTimer
         interval: 300
@@ -1197,8 +1202,8 @@ Item {
           hoverEnabled: true
           acceptedButtons: Qt.LeftButton
           cursorShape: Qt.PointingHandCursor
-          onEntered: { dockCard.pillHover = true; dockCard.hoverHideTimer.stop() }
-          onExited: { dockCard.pillHover = false; dockCard.hoverHideTimer.restart() }
+          onEntered: { dockCard.pillHover = true; dockCard.hoverHideTimerStop() }
+          onExited: { dockCard.pillHover = false; dockCard.hoverHideTimerRestart() }
         }
 
         Flow {
@@ -1306,8 +1311,8 @@ Item {
           hoverEnabled: true
           acceptedButtons: Qt.LeftButton
           cursorShape: Qt.PointingHandCursor
-          onEntered: { dockCard.pillHover = true; dockCard.hoverHideTimer.stop() }
-          onExited: { dockCard.pillHover = false; dockCard.hoverHideTimer.restart() }
+          onEntered: { dockCard.pillHover = true; dockCard.hoverHideTimerStop() }
+          onExited: { dockCard.pillHover = false; dockCard.hoverHideTimerRestart() }
         }
 
         // header: app icon + window title + window buttons
