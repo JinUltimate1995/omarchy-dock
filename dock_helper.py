@@ -106,6 +106,11 @@ def lua_raisetop(addr):
             "\", mode = \"top\" })")
 
 
+def lua_float(addr):
+    return ("hl.dsp.window.float({ window = \"" + sel(addr) +
+            "\", action = \"on\" })")
+
+
 def main():
     args = sys.argv[1:]
     if len(args) < 1:
@@ -181,15 +186,15 @@ def main():
 
     if action == "restore":
         # bring the window back onto the workspace the user is actually on:
-        # move it out of the scratchpad first, then focus it. NOTE: do NOT
-        # alter_zorder after focusing — that dispatcher STEALS focus
-        # (verified live); focusing a tiled window already raises it.
+        # move it out of the scratchpad first, ensure floating, then focus and raise it.
         ws = active_ws_id()
         if ws is not None and ws >= 0:
             r1 = ipc(lua_restore(addr, ws))
         else:
             r1 = "ok(no-ws)"
+        ipc(lua_float(addr))
         r2 = ipc(lua_focus(addr))
+        ipc(lua_raisetop(addr))
         return report("restore", r2 if r2.startswith("ok") else r1)
 
     if action == "togglemax":
@@ -205,6 +210,7 @@ def main():
             r = ipc(lua_fullscreen(addr, 1))
         else:
             r = ipc(lua_fullscreen(addr, 0))
+        ipc(lua_raisetop(addr))
         print(f"togglemax {addr[-4:]} (fs was {fs}): {r}")
         return 0 if r.startswith("ok") else 4
 
